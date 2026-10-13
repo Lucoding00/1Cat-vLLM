@@ -22,7 +22,6 @@ def _sm70_device():
 def _can_combine_fc(model, embedding, hidden):
     if (
         envs.VLLM_BATCH_INVARIANT
-        or not is_sm70_decode_graph_compiling()
         or embedding.ndim != 2
         or hidden.ndim != 2
         or embedding.shape[-1] != 2560
@@ -35,7 +34,8 @@ def _can_combine_fc(model, embedding, hidden):
     ):
         return False
     return all(
-        type(layer) is ColumnParallelLinear
+        hasattr(model, attr)
+        and type(layer := getattr(model, attr)) is ColumnParallelLinear
         and type(layer.quant_method) is UnquantizedLinearMethod
         and layer.tp_size == 4
         and layer.gather_output
@@ -43,7 +43,7 @@ def _can_combine_fc(model, embedding, hidden):
         and layer.bias is None
         and layer.weight.shape == (640, 2560)
         and layer.weight.dtype == torch.float16
-        for layer in (model.fc_embedding, model.fc_hidden)
+        for attr in ("fc_embedding", "fc_hidden")
     )
 
 

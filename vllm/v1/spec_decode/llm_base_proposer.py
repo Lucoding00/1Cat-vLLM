@@ -1185,6 +1185,28 @@ class SpecDecodeBaseProposer:
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
         self._step_profiler.finish(profile_events, "first_forward", first_forward_start)
+        is_all_chunked_prefill_fn = getattr(
+            self.runner, "_is_all_reqs_chunked_prefill", None
+        )
+        if (
+            is_all_chunked_prefill_fn is not None
+            and getattr(getattr(self.runner, "input_batch", None), "num_reqs", 0) > 0
+            and is_all_chunked_prefill_fn()
+        ):
+            self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
+            self._step_profiler.add_cpu_ms(
+                profile_cpu_ms, "total_wall_cpu", profile_wall_start
+            )
+            self._step_profiler.report_proposal(
+                profile_events, profile_cpu_ms, batch_size, num_tokens
+            )
+            if isinstance(self._static_draft_vocab, DynamicDraftVocabRuntime):
+                self._static_draft_vocab.end_proposal()
+            return torch.zeros(
+                (batch_size, self.num_speculative_tokens),
+                dtype=torch.int32,
+                device=self.device,
+            )
         if ddtree_worker_profile:
             forward_enqueue_ms = (time.perf_counter() - forward_enqueue_t0) * 1000.0
             sync_t0 = time.perf_counter()

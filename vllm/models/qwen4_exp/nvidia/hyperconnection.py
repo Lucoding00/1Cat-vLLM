@@ -240,6 +240,17 @@ class GatedResidual(nn.Module):
         prev_block_output: torch.Tensor,
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        mtp_buf = getattr(self, "_mtp_hidden_buffer", None)
+        out_buf = None
+        if (
+            mtp_buf is not None
+            and not torch.compiler.is_compiling()
+            and mtp_buf.device == hidden_states.device
+            and mtp_buf.dtype == hidden_states.dtype
+            and mtp_buf.shape[0] >= hidden_states.shape[0]
+            and mtp_buf.shape[1:] == hidden_states.shape[1:]
+        ):
+            out_buf = mtp_buf[: hidden_states.shape[0]]
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,
@@ -247,6 +258,7 @@ class GatedResidual(nn.Module):
             self.hc_norm.weight,
             self.config.rms_norm_eps,
             self.hc_count,
+            out=out_buf,
         )
 
         block_input, injection = self._project(xn)

@@ -310,6 +310,50 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # Phase 2: the drafter shares the target cache_config; remember the main
         # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
         self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
+        topk_indices_buffer: torch.Tensor | None = None
+        dcp_local_indices_buffer: torch.Tensor | None = None
+        dcp_partial_output_buffer: torch.Tensor | None = None
+        dcp_partial_lse_buffer: torch.Tensor | None = None
+        if getattr(config, "indexer_n_heads", None) is not None:
+            max_tokens = draft_vllm_config.scheduler_config.max_num_batched_tokens
+            width = (
+                int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1
+            )
+            topk_indices_buffer = torch.empty(
+                max_tokens,
+                width,
+                dtype=torch.int32,
+            )
+            self.topk_indices_buffer = topk_indices_buffer
+            if draft_vllm_config.parallel_config.decode_context_parallel_size == 2:
+                tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+                local_q_heads = int(config.num_attention_heads) // max(tp_size, 1)
+                head_dim = int(
+                    getattr(
+                        config,
+                        "head_dim",
+                        config.hidden_size // config.num_attention_heads,
+                    )
+                )
+                dcp_local_indices_buffer = torch.empty(
+                    max_tokens,
+                    width,
+                    dtype=torch.int32,
+                )
+                dcp_partial_output_buffer = torch.empty(
+                    max_tokens,
+                    local_q_heads,
+                    head_dim,
+                    dtype=model_config.dtype,
+                )
+                dcp_partial_lse_buffer = torch.empty(
+                    max_tokens,
+                    local_q_heads,
+                    dtype=torch.float32,
+                )
+                self.dcp_local_indices_buffer = dcp_local_indices_buffer
+                self.dcp_partial_output_buffer = dcp_partial_output_buffer
+                self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
@@ -338,6 +382,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     draft_vllm_config,
                     layer_type="full_attention",
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
+                    topk_indices_buffer=topk_indices_buffer,
+                    dcp_local_indices_buffer=dcp_local_indices_buffer,
+                    dcp_partial_output_buffer=dcp_partial_output_buffer,
+                    dcp_partial_lse_buffer=dcp_partial_lse_buffer,
                 )
                 for idx in range(self.num_mtp_layers)
             )

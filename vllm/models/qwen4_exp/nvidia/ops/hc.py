@@ -335,13 +335,14 @@ def _hc_combine_norm_kernel(
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
 
 
-def _hc_combine_norm(
+def _hc_combine_norm_impl(
     residual: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     N, DIM = residual.shape
     assert DIM % hc_count == 0
@@ -354,7 +355,11 @@ def _hc_combine_norm(
     assert norm_weight.is_contiguous()
     assert norm_weight.numel() in (hc_dim, DIM)
 
-    out = residual.new_empty(residual.shape)
+    if out is None:
+        out = residual.new_empty(residual.shape)
+    else:
+        assert out.shape == residual.shape
+        assert out.stride(1) == 1
     y = residual.new_empty(residual.shape)
     # The M=1 SM70 path is register-bound with the generic 512-wide tile.
     # A 1024-wide tile keeps identical reduction/rounding results and is
@@ -389,6 +394,24 @@ def _hc_combine_norm(
         num_warps=4,
     )
     return out, y
+
+
+def _hc_combine_norm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _hc_combine_norm_impl(
+        residual,
+        block_output,
+        injection_logits,
+        norm_weight,
+        eps,
+        hc_count,
+    )
 
 
 def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
@@ -483,7 +506,18 @@ def hc_combine_norm(
     norm_weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if out is not None and not torch.compiler.is_compiling():
+        return _hc_combine_norm_impl(
+            residual,
+            block_output,
+            injection_logits,
+            norm_weight,
+            eps,
+            hc_count,
+            out=out,
+        )
     return torch.ops.vllm.qwen4_exp_hc_combine_norm(
         residual,
         block_output,

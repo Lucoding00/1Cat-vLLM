@@ -8234,7 +8234,7 @@ class GPUModelRunner(
         request (e.g., for chunked prefill requests that are not the last
         prefill chunk)."""
         num_reqs = self.input_batch.num_reqs
-        return bool(self.discard_request_mask.np[:num_reqs].all())
+        return num_reqs > 0 and bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
     def execute_model(
@@ -9099,7 +9099,10 @@ class GPUModelRunner(
                 self._step_profiler.add_cpu_context(
                     mtp_profile_ctx, "draft_wall_cpu", mtp_draft_wall_start
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                self._copy_draft_token_ids_to_cpu(
+                    scheduler_output,
+                    zeros_only=self._is_all_reqs_chunked_prefill(),
+                )
                 if trace_log:
                     trace_draft_ms += (time.perf_counter() - trace_draft_t0) * 1000.0
 

@@ -412,11 +412,24 @@ class RMSNormGated(CustomOp):
             and self.group_size is None
             and self.norm_before_gate
             and self.activation in ("sigmoid", "silu", "swish")
-            and _sm70_gated_norm_shape_supported(x, z, self.weight)
         ):
-            return torch.ops.vllm.sm70_rmsnorm_gated_exact(
-                x, z, self.weight, self.eps, self.activation != "sigmoid"
-            )
+            if _sm70_gated_norm_shape_supported(x, z, self.weight):
+                return torch.ops.vllm.sm70_rmsnorm_gated_exact(
+                    x, z, self.weight, self.eps, self.activation != "sigmoid"
+                )
+            if (
+                not torch.compiler.is_compiling()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                return _compiled_rmsnorm_gated_forward_static(
+                    x,
+                    z,
+                    self.weight,
+                    self.eps,
+                    x.dtype,
+                    self.norm_before_gate,
+                    self.activation,
+                )
         return self.forward_static(
             x,
             z,
@@ -448,6 +461,28 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.forward_cuda(x, z)
+
+
+@torch.compile(dynamic=True)
+def _compiled_rmsnorm_gated_forward_static(
+    x: torch.Tensor,
+    z: torch.Tensor | None,
+    weight: torch.Tensor,
+    epsilon: float,
+    orig_dtype: torch.dtype,
+    norm_before_gate: bool,
+    activation: str,
+) -> torch.Tensor:
+    return RMSNormGated.forward_static(
+        x,
+        z,
+        weight,
+        epsilon,
+        orig_dtype,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        activation=activation,
+    )
 
 
 class LayerNorm(nn.Module):

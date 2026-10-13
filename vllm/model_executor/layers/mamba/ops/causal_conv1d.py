@@ -540,7 +540,13 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
+    dim, cu_seqlen = x.shape
+    out = (
+        x.new_empty((cu_seqlen, dim)).transpose(0, 1)
+        if is_channel_last
+        else torch.empty_like(x)
+    )
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -558,8 +564,6 @@ def causal_conv1d_fn(
             (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
         )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
 
-    is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
-    dim, cu_seqlen = x.shape
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)

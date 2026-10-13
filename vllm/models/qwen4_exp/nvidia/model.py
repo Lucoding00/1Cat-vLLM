@@ -845,6 +845,8 @@ class Qwen4ExpModel(nn.Module):
                 config.hc_count * config.hidden_size,
                 dtype=vllm_config.model_config.dtype,
             )
+            if self.hyper_connection_mixer is not None:
+                self.hyper_connection_mixer._mtp_hidden_buffer = self._mtp_hidden_buffer
         else:
             self._mtp_hidden_buffer = None
 
@@ -930,7 +932,11 @@ class Qwen4ExpModel(nn.Module):
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
-        if self._mtp_hidden_buffer is not None:
+        if self._mtp_hidden_buffer is not None and not (
+            getattr(final_mixer, "_partial_inputs", False)
+            and getattr(final_mixer, "_mtp_hidden_buffer", None)
+            is self._mtp_hidden_buffer
+        ):
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
