@@ -20,6 +20,7 @@ def _localize_indices(
     src_stride,
     dst_stride,
     WIDTH: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
     INTERLEAVE: tl.constexpr,
@@ -33,8 +34,12 @@ def _localize_indices(
     position = tl.cumsum(owned.to(tl.int32), 0) - 1
     count = tl.sum(owned.to(tl.int32), 0)
     # Disjoint writes avoid races between warp-local compaction and padding.
-    tl.store(dst + row * dst_stride + col, -1, (col < WIDTH) & (col >= count))
-    tl.store(dst + row * dst_stride + position, local, owned)
+    tl.store(dst + row * dst_stride + col, -1, (col < OUT_WIDTH) & (col >= count))
+    tl.store(
+        dst + row * dst_stride + position,
+        local,
+        owned & (position < OUT_WIDTH),
+    )
 
 
 def qsa_dcp_local_selection_width(
@@ -77,7 +82,14 @@ def qsa_localize_dcp_indices(
     Requiring interleave to divide a local page makes flat localization agree
     with block-table slot mapping at every global page boundary.
     """
-    if indices.ndim != 2 or out.shape != indices.shape or indices.shape[1] == 0:
+    if (
+        indices.ndim != 2
+        or out.ndim != 2
+        or out.shape[0] != indices.shape[0]
+        or indices.shape[1] == 0
+        or out.shape[1] == 0
+        or out.shape[1] > indices.shape[1]
+    ):
         raise ValueError("QSA DCP needs matching [rows, selection_width] buffers")
     if indices.dtype != torch.int32 or out.dtype != torch.int32:
         raise ValueError("QSA DCP indices must be int32")
@@ -100,7 +112,7 @@ def qsa_localize_dcp_indices(
     if indices.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
         raise ValueError("QSA DCP output must not alias the MTP selection buffer")
     if dcp_world_size == 1:
-        out.copy_(indices)
+        out.copy_(indices[:, : out.shape[1]])
         return out
     if not indices.is_cuda:
         raise ValueError("QSA DCP localization requires CUDA buffers")
@@ -110,6 +122,7 @@ def qsa_localize_dcp_indices(
         indices.stride(0),
         out.stride(0),
         WIDTH=indices.shape[1],
+        OUT_WIDTH=out.shape[1],
         WORLD=dcp_world_size,
         RANK=dcp_rank,
         INTERLEAVE=interleave_size,

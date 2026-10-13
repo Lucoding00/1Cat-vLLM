@@ -198,6 +198,7 @@ def _dcp_a2a_unpack_combine_kernel(
     recv_ptr,
     out_ptr,
     out_lse_ptr,
+    gate_ptr,
     recv_stride_N,
     recv_stride_B,
     recv_stride_H,
@@ -207,11 +208,15 @@ def _dcp_a2a_unpack_combine_kernel(
     out_stride_D,
     out_lse_stride_B,
     out_lse_stride_H,
+    gate_stride_B,
+    gate_stride_H,
+    gate_stride_D,
     N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     LSE_PACK_DIM: tl.constexpr,
+    HAS_OUTPUT_GATE: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0).to(tl.int64)
     head_idx = tl.program_id(1).to(tl.int64)
@@ -310,6 +315,18 @@ def _dcp_a2a_unpack_combine_kernel(
     final_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
     )
+    if HAS_OUTPUT_GATE:
+        # Round combined attention output to out_ptr's dtype first, matching
+        # DCP1's attention output and the unfused output.copy_(merged) +
+        # _qsa_output_gate sequence bit-for-bit.
+        rounded = acc.to(out_ptr.dtype.element_ty)
+        gate_offsets = (
+            batch_idx * gate_stride_B
+            + head_idx * gate_stride_H
+            + d_offsets * gate_stride_D
+        )
+        gate = tl.load(gate_ptr + gate_offsets).to(tl.float32)
+        acc = rounded.to(tl.float32) * tl.sigmoid(gate)
     tl.store(out_ptr + final_offsets, acc)
 
     if RETURN_LSE:
@@ -353,23 +370,32 @@ def _dcp_a2a_unpack_combine(
     lse_pack_dim: int,
     return_lse: bool,
     is_lse_base_on_e: bool,
+    out: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
-    out = torch.empty(
-        (num_tokens, h_per_rank, head_dim),
-        device=recv_buffer.device,
-        dtype=recv_buffer.dtype,
+    if out is None:
+        out = torch.empty(
+            (num_tokens, h_per_rank, head_dim),
+            device=recv_buffer.device,
+            dtype=recv_buffer.dtype,
+        )
+    out_lse = (
+        torch.empty(
+            (num_tokens, h_per_rank),
+            device=recv_buffer.device,
+            dtype=torch.float32,
+        )
+        if return_lse
+        else None
     )
-    out_lse = torch.empty(
-        (num_tokens, h_per_rank) if return_lse else (1, 1),
-        device=recv_buffer.device,
-        dtype=torch.float32 if return_lse else recv_buffer.dtype,
-    )
+    has_gate = output_gate is not None
     grid = (num_tokens, h_per_rank, 1)
     _dcp_a2a_unpack_combine_kernel[grid](
         recv_buffer,
         out,
         out_lse,
+        output_gate,
         recv_buffer.stride(0),
         recv_buffer.stride(1),
         recv_buffer.stride(2),
@@ -377,15 +403,20 @@ def _dcp_a2a_unpack_combine(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        out_lse.stride(0),
-        out_lse.stride(1),
+        out_lse.stride(0) if out_lse is not None else 0,
+        out_lse.stride(1) if out_lse is not None else 0,
+        output_gate.stride(0) if output_gate is not None else 0,
+        output_gate.stride(1) if output_gate is not None else 0,
+        output_gate.stride(2) if output_gate is not None else 0,
         N=world_size,
         HEAD_DIM=head_dim,
         IS_BASE_E=is_lse_base_on_e,
         RETURN_LSE=return_lse,
         LSE_PACK_DIM=lse_pack_dim,
+        HAS_OUTPUT_GATE=has_gate,
     )
     if return_lse:
+        assert out_lse is not None
         return out, out_lse
     return out
 
@@ -397,6 +428,8 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
+    out: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -411,6 +444,9 @@ def dcp_a2a_lse_reduce(
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
+        out: Optional preallocated [B, H/N, D] output buffer
+        output_gate: Optional [B, H/N, D] sigmoid gate applied after rounding to
+            out.dtype
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -419,9 +455,17 @@ def dcp_a2a_lse_reduce(
     world_size = cp_group.world_size
 
     if world_size == 1:
+        result = cp_attn_out
+        if out is not None:
+            out.copy_(cp_attn_out)
+            result = out
+        if output_gate is not None:
+            result.copy_(
+                (result.float() * torch.sigmoid(output_gate.float())).to(result.dtype)
+            )
         if return_lse:
-            return cp_attn_out, cp_attn_lse
-        return cp_attn_out
+            return result, cp_attn_lse
+        return result
 
     B, H, D = cp_attn_out.shape
     if H % world_size != 0:
@@ -454,5 +498,11 @@ def dcp_a2a_lse_reduce(
     work.wait()
 
     return _dcp_a2a_unpack_combine(
-        recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
+        recv_buffer,
+        D,
+        lse_pack_dim,
+        return_lse,
+        is_lse_base_on_e,
+        out=out,
+        output_gate=output_gate,
     )

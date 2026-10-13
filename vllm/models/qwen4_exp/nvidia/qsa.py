@@ -153,10 +153,20 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
             ):
                 raise RuntimeError("QSA draft block-table buffer is too small")
             expanded = self.draft_block_table_buffer[:rows, : columns * expansion]
-            expanded_view = expanded.view(rows, columns, expansion)
-            for sub_block in range(expansion):
-                torch.mul(table, expansion, out=expanded_view[:, :, sub_block])
-                expanded_view[:, :, sub_block].add_(sub_block)
+            expanded_view = expanded.unflatten(1, (columns, expansion))
+            sub_block_offsets = getattr(self, "_draft_sub_block_offsets", None)
+            if (
+                sub_block_offsets is None
+                or sub_block_offsets.shape[-1] != expansion
+                or sub_block_offsets.device != table.device
+                or sub_block_offsets.dtype != table.dtype
+            ):
+                sub_block_offsets = torch.arange(
+                    expansion, dtype=table.dtype, device=table.device
+                ).view(1, 1, expansion)
+                self._draft_sub_block_offsets = sub_block_offsets
+            torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)
+            expanded_view.add_(sub_block_offsets)
             common_attn_metadata = common_attn_metadata.replace(
                 block_table_tensor=expanded
             )
@@ -268,10 +278,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        if num_tokens and getattr(layer, "host_kv_enabled", False):
-            # Direct host QSA writes every active row, including empty
-            # selections. Only graph padding requires explicit initialization.
-            output[num_tokens:].zero_()
+        if num_tokens and (
+            getattr(layer, "host_kv_enabled", False)
+            or getattr(layer, "qsa_dcp_sharded", False)
+        ):
+            # Direct host QSA and DCP QSA write every active row, including
+            # empty selections. Only graph padding requires explicit initialization.
+            if num_tokens < output.shape[0]:
+                output[num_tokens:].zero_()
         else:
             output.zero_()
         if num_tokens == 0:
@@ -386,6 +400,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_gate: torch.Tensor,
     ) -> None:
         from vllm.distributed import get_dcp_group
+        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 
         from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
         from .ops.qsa_dcp import (
@@ -405,9 +420,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             )
         ):
             raise RuntimeError("QSA DCP target workspaces are not initialized")
+        # Only this prefix of the compacted columns can hold an owned token.
+        local_width = qsa_dcp_local_selection_width(
+            layer.indexer.token_topk,
+            layer.indexer.compress_ratio,
+            self.dcp_world_size,
+            layer.cp_kv_cache_interleave_size,
+            logical_indices.shape[1],
+        )
         local_indices = qsa_localize_dcp_indices(
             logical_indices,
-            local_indices_buffer[: query.shape[0]],
+            local_indices_buffer[: query.shape[0], :local_width],
             dcp_world_size=self.dcp_world_size,
             dcp_rank=self.dcp_rank,
             interleave_size=layer.cp_kv_cache_interleave_size,
@@ -419,19 +442,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         partial_lse = partial_lse_buffer[: query.shape[0]]
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
-        # Only this prefix of the compacted columns can hold an owned token.
-        local_width = qsa_dcp_local_selection_width(
-            layer.indexer.token_topk,
-            layer.indexer.compress_ratio,
-            self.dcp_world_size,
-            layer.cp_kv_cache_interleave_size,
-            local_indices.shape[1],
-        )
         qsa_sparse_paged_attention(
             gathered_query,
             key_cache,
             value_cache,
-            local_indices[:, :local_width],
+            local_indices,
             block_table,
             token_to_req,
             partial_output,
@@ -440,6 +455,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             v_scale=layer._v_scale_float,
             lse=partial_lse,
         )
+        gate_view = output_gate.view_as(output)
+        if self.dcp_combine is dcp_a2a_lse_reduce:
+            dcp_a2a_lse_reduce(
+                partial_output,
+                partial_lse,
+                group,
+                is_lse_base_on_e=False,
+                out=output,
+                output_gate=gate_view,
+            )
+            return
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -453,7 +479,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # apply the Triton gate DCP1's page4 route uses. This replaces a chain
         # of five elementwise kernels (12.2 us per decode layer on V100).
         output.copy_(merged)
-        _qsa_output_gate(output, output_gate.view_as(output))
+        _qsa_output_gate(output, gate_view)
 
 
 def _verify_e4m3_kv_requirements(

@@ -70,6 +70,10 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
         torch.Tensor,
     ],
 ] = {}
+_SM70_QSA_SPLITK_WORKSPACES: dict[
+    tuple[int, int],
+    tuple[int, int, torch.Tensor, torch.Tensor],
+] = {}
 _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
 
 
@@ -2001,6 +2005,40 @@ def _qsa_grouped_page4_workspace(
     )
 
 
+def _qsa_splitk_workspace(
+    q: torch.Tensor,
+    num_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (device_index, stream_id)
+    cache = workspace_cache("qsa_splitk", _SM70_QSA_SPLITK_WORKSPACES)
+    workspace = cache.get(key)
+    rows, heads, head_dim = q.shape
+    needed_lse = num_splits * rows * heads
+    needed_out = needed_lse * head_dim
+    if workspace is None or workspace[0] < needed_out or workspace[1] < needed_lse:
+        out_capacity = 1 << (max(needed_out, 1) - 1).bit_length()
+        lse_capacity = 1 << (max(needed_lse, 1) - 1).bit_length()
+        if workspace is not None:
+            out_capacity = max(out_capacity, workspace[0])
+            lse_capacity = max(lse_capacity, workspace[1])
+        partial_output_buf = torch.empty(
+            (out_capacity,), dtype=torch.float32, device=q.device
+        )
+        partial_lse_buf = torch.empty(
+            (lse_capacity,), dtype=torch.float32, device=q.device
+        )
+        workspace = (out_capacity, lse_capacity, partial_output_buf, partial_lse_buf)
+        cache[key] = workspace
+    retain_for_capture(cache, workspace, q)
+    _, _, partial_output_buf, partial_lse_buf = workspace
+    return (
+        partial_output_buf[:needed_out].view(num_splits, rows, heads, head_dim),
+        partial_lse_buf[:needed_lse].view(num_splits, rows, heads),
+    )
+
+
 def _qsa_xqa_page4_physical_kv(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2525,15 +2563,9 @@ def qsa_sparse_paged_attention(
         partial_lse = out
     else:
         # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
-        )
+        # splits. Reuse per-stream scratch buffers to avoid 24 dynamic tensor
+        # allocations per step across the 12 target QSA layers on TP4+DCP2.
+        partial_output, partial_lse = _qsa_splitk_workspace(q, num_splits)
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](

@@ -142,9 +142,44 @@ To reach the full theoretical ceiling on 4×V100 (`7,800–8,300 tok/s` 8K prefi
 
 ---
 
-## 5. 8×V100 Deployment & `TP8` Feasibility Analysis
+## 5. `TP4 + DCP2` Decode Path Optimization Analysis & Implemented Changes
 
-### 5.1 Why Pure `TP8` Fails on Startup Today
+Under **`TP4 + DCP2`** (`--tensor-parallel-size 4 --decode-context-parallel-size 2`), the 4 TP ranks are split into two DCP groups of size 2 (`{0, 1}` and `{2, 3}`), with `dcp_comm_backend="a2a"` by default (`vllm/model_executor/models/config.py:772-779`).
+- **Sharded Target QSA Main KV Cache (`qsa_dcp_sharded = True`)**: Only the 12 target QSA main KV caches are sharded across DCP (`local_block_size = 200` for scheduler `block_size = 400`, `cp_kv_cache_interleave_size = 1`), packed 2 layers per physical page alongside **6 GDN state groups** of 6 layers each (vs. 3 GDN groups at `DCP1`).
+- **Replicated Selector & Draft Caches (`dcp_sharded = False`)**: All 13 QSA selectors (raw circular buffer + compressed key cache) and the MTP draft QSA layer (`layers.48`) stay replicated across DCP so top-$k$ block selection and MTP draft generation remain communication-free.
+- **Per-Layer Target QSA Decode Execution (`_forward_qsa_dcp`)**:
+  1. `qsa_localize_dcp_indices` compacts the rank-owned subset of the `[B, 2051]` global token selection into local page coordinates.
+  2. `group.all_gather(query.contiguous(), dim=1)` gathers Q heads from `[B, 6, 256]` to `[B, 12, 256]` across the 2-rank DCP group.
+  3. `qsa_sparse_paged_attention` runs local sparse GQA (`12` Q heads, `1` KV head, `group_size=12`, `local_width=1026`) and emits FP32 `partial_output` (`[B, 12, 256]`) and base-2 `partial_lse` (`[B, 12]`).
+  4. `dcp_a2a_lse_reduce` packs `partial_output` + `partial_lse`, exchanges them via `dist.all_to_all_single`, and combines the 2 ranks' partial outputs weighted by base-2 LSE back to `[B, 6, 256]`, followed by FP16 rounding and sigmoid output gating.
+
+### 5.1 Bit-Exact `TP4 + DCP2` Decode Optimizations Implemented
+
+| # | Subsystem | File(s) Modified | Bottleneck Identified on `TP4 + DCP2` Decode | Optimization Implemented | Bit-Exact? |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **D1** | **QSA DCP Combine + Round + Sigmoid Gate Fusion** | `vllm/v1/attention/ops/dcp_alltoall.py`, `vllm/models/qwen4_exp/nvidia/qsa.py` | After `all_to_all_single`, `_dcp_a2a_unpack_combine` allocated an intermediate FP32 `out` (`[B, 6, 256]`) and a dummy `(1, 1)` `out_lse` tensor on the GPU, then `_forward_qsa_dcp` launched `output.copy_(merged)` (`FP32 -> FP16` cast kernel) followed by `_qsa_output_gate` (a separate Triton sigmoid gate kernel). | Extended `dcp_a2a_lse_reduce` / `_dcp_a2a_unpack_combine_kernel` with optional `out` and `output_gate` parameters (`HAS_OUTPUT_GATE: tl.constexpr`) that round `acc` to `out.dtype` (`FP16`) in registers, multiply by `tl.sigmoid(gate)` in `FP32`, and store directly to `output`, while eliminating the dummy `(1, 1)` `out_lse` allocation when `return_lse=False`. Saves **24 kernel launches + 24 tensor allocations + 36 HBM round-trips per decode step**. | **Yes (100% bitwise identical)** |
+| **D2** | **Half-Width Output Write in `qsa_localize_dcp_indices`** | `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py`, `vllm/models/qwen4_exp/nvidia/qsa.py` | `_forward_qsa_dcp` called `qsa_localize_dcp_indices` with the full `[B, 2051]` `local_indices_buffer` before computing `local_width = 1026`, writing `-1` padding across all `2051` columns even though only `:1026` can hold owned tokens or are read by `qsa_sparse_paged_attention`. | Compute `local_width` first and pass `local_indices_buffer[:B, :local_width]` (`OUT_WIDTH = 1026`) into `qsa_localize_dcp_indices`, cutting padding stores in half (`1026` vs. `2051` columns per query row). | **Yes (100% bitwise identical)** |
+| **D3** | **Persistent Split-K Scratch Workspace in `qsa_sparse_paged_attention`** | `vllm/models/qwen4_exp/nvidia/ops/qsa.py` | Under `TP4 + DCP2`, `_forward_qsa_dcp` passes `lse=partial_lse` (`group_size=12`, `page_size=200`), so `qsa_sparse_paged_attention` always takes the Triton split-K path and dynamically allocated `partial_output` (`[num_splits, B, 12, 256]` FP32) and `partial_lse` (`[num_splits, B, 12]` FP32) on every QSA layer (`24` allocations/step). | Added `_qsa_splitk_workspace(q, num_splits)` backed by `workspace_cache("qsa_splitk", _SM70_QSA_SPLITK_WORKSPACES)` and `retain_for_capture`, reusing per-stream persistent FP32 scratch buffers across all 12 QSA layers and eliminating **24 dynamic GPU allocations per decode step**. | **Yes (100% bitwise identical)** |
+| **D4** | **Skip Full-Buffer `output.zero_()` on DCP QSA Decode** | `vllm/models/qwen4_exp/nvidia/qsa.py` | `forward_qsa` called `output.zero_()` on the entire buffer for all non-host-KV layers, even though `_forward_qsa_dcp` (`qsa_dcp_sharded=True`) unconditionally overwrites every active row `output[:num_tokens]` (including empty selections). | Extended the padding-only zero guard to `qsa_dcp_sharded`, only zeroing `output[num_tokens:]` when `num_tokens < output.shape[0]` (eliminating **12 `zero_()` kernel launches per decode step** when unpadded). | **Yes (100% bitwise identical)** |
+| **D5** | **Vectorized Replicated-Draft Block-Table Expansion in `DCP2`** | `vllm/models/qwen4_exp/nvidia/qsa.py` | `Qwen4ExpQSAMetadataBuilder.build` expanded the replicated MTP draft layer's block table via a Python `for sub_block in range(expansion):` loop, launching `2 * expansion` small strided elementwise kernels per step. | Replaced the Python loop with a single broadcasted `torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)` + `expanded_view.add_(sub_block_offsets)` over a cached `(1, 1, expansion)` offset tensor. | **Yes (100% bitwise identical)** |
+| **D6** | **Lazy `compute_num_computed_tokens()` across 6 GDN Groups on Decode** | `vllm/v1/attention/backends/gdn_attn.py` | Because `TP4 + DCP2` packs 2 QSA layers per physical page, the 36 GDN layers are partitioned into **6 GDN KV-cache groups** (vs. 3 at `DCP1`). `GDNAttentionMetadataBuilder.build` unconditionally called `m.compute_num_computed_tokens()` (`torch.diff(query_start_loc)` + `seq_lens - query_len`), even though `context_lens_tensor` is only read inside `if num_prefills > 0:`. | Moved `context_lens_tensor = m.compute_num_computed_tokens()` inside `if num_prefills > 0:`, eliminating **12 wasted GPU kernel launches and 12 tensor allocations per decode step** (and up to 60 in uncached MTP4 fallback builds). | **Yes (100% bitwise identical)** |
+
+### 5.2 Phase-2 `TP4 + DCP2` Decode Optimization Opportunities (Next Steps)
+
+1. **Extend `_sm70_qsa_prep` C++ Fused Prep Kernel to `fp8_e4m3` KV Cache (`csrc/sm70_turbomind/ops/qsa_prep_sm70.cu`, `vllm/models/qwen4_exp/nvidia/qsa.py:598-606`)**:
+   - Under `--kv-cache-dtype auto` without MTP (or when calibrated E4M3 scales are present in the checkpoint), `cache_config.cache_dtype` resolves to `"fp8_e4m3"` (`vllm/models/qwen4_exp/nvidia/qsa.py:486`).
+   - Currently `_sm70_qsa_prep` only admits `cache_config.cache_dtype in ("auto", "float16")` (`qsa.py:604`), so under calibrated `fp8_e4m3` KV cache, QSA falls back to separate `q_norm`, `k_norm`, `apply_rotary_emb_ inplace`, and `reshape_and_cache_flash` kernels (`~6` extra kernels per QSA layer = `72` kernels/step). Adding E4M3 quantization (`k_scale`, `v_scale`) to `qsa_prep_sm70.cu`'s KV cache write epilogue will restore the single-launch fused QSA prep path for E4M3 KV caches.
+2. **SM70 Two-Warp Partial & Native XQA Decode Support for `DCP2` `group_size = 12` (`vllm/models/qwen4_exp/nvidia/ops/qsa.py:2513, 2608`, `flash-attention-v100/kernel/flash_decode_paged.cu`)**:
+   - At `TP4 + DCP1`, each rank has `6` Q heads and `1` KV head (`group_size = 6`, `block_m = 8`), which hits both the native Flash-V100 `decode_paged_xqa_fwd` (`q.shape[1:] == (6, 256)`) and `_use_sm70_qsa_two_warp_partial` (`group_size == 6`).
+   - At `TP4 + DCP2`, `gathered_query` has `12` Q heads and `1` KV head (`group_size = 12`, `block_m = 16`), which bypasses `decode_paged_xqa_fwd` (also because `lse` is required) and uses `partial_warps = 4, target_splits = 64` in `_qsa_sparse_paged_gqa_splitk_kernel`. Adding a `group_size = 12` (`H=12, D=256`) LSE-emitting specialization to `flash_decode_paged.cu` (or tuning `target_splits = 32, partial_warps = 2` for `local_width = 1026` on V100) can cut `TP4 + DCP2` sparse attention kernel time by ~20–30%.
+3. **Eliminate Unused `prepare_dcp_local_seq_lens` Launch When Only QSA Uses DCP (`vllm/v1/worker/gpu/model_runner.py:1090`, `vllm/v1/worker/gpu/cudagraph_utils.py:813`)**:
+   - `ModelRunnerV2` launches `prepare_dcp_local_seq_lens` on every step when `self.use_dcp` is `True`, even though `Qwen4ExpQSAMetadataBuilder` sets `builds_dcp_context_lens = False` and only `MLAAttentionMetadataBuilder` reads `common_attn_metadata.dcp_local_seq_lens`. Gating `prepare_dcp_local_seq_lens` on whether any attention group requires `dcp_local_seq_lens` saves 1 extra Triton kernel launch per step.
+
+---
+
+## 6. 8×V100 Deployment & `TP8` Feasibility Analysis
+
+### 6.1 Why Pure `TP8` Fails on Startup Today
 
 1. **`ModelOptNvFp4SM70MoEMethod` Hardcoded TP Gate (`vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py:594-624`)**:
    - `_SUPPORTED_TP_SIZES = (1, 2, 4)` explicitly raises `NotImplementedError` when `tp_size == 8`.
@@ -156,7 +191,7 @@ To reach the full theoretical ceiling on 4×V100 (`7,800–8,300 tok/s` 8K prefi
    - At `TP8`, KV heads must be replicated (`4` ranks per KV head), and Q heads drop to `24 / 8 = 3` per rank.
    - All SM70 TP4-specialized fastpaths (`flash_decode_paged.cu` XQA `H=6, D=256`, `sm70_fp16_gemv.py` GDN `H_v=12`, `sm70_ring.py` / `sm70_hc_ll.py` 4-rank collectives) fall back to generic Triton/NCCL paths, and 8-GPU ring AllReduce latency (`~4.5 ms/round`) exceeds the compute savings on V100.
 
-### 5.2 Recommended 8×V100 Topologies
+### 6.2 Recommended 8×V100 Topologies
 
 | 8×V100 Topology | Configuration | Best Use Case | Performance vs. 4×V100 `TP4` |
 | :--- | :--- | :--- | :--- |
@@ -165,12 +200,19 @@ To reach the full theoretical ceiling on 4×V100 (`7,800–8,300 tok/s` 8K prefi
 
 ---
 
-## 6. Verification & Benchmark Commands on V100
+## 7. Verification & Benchmark Commands on V100
 
 ```bash
-# 1. Run unit tests covering QSA, GDN tail split, NVFP4 MoE workspace, and baseline contract
+# 1. Run unit tests covering QSA, DCP2, GDN metadata/tail split, NVFP4 MoE workspace, and baseline contract
 pytest -q \
   tests/models/qwen4_exp/test_config.py \
+  tests/models/qwen4_exp/test_qsa_dcp_indices.py \
+  tests/models/qwen4_exp/test_qsa_dcp_local_width.py \
+  tests/models/qwen4_exp/test_qsa_dcp_attention.py \
+  tests/models/qwen4_exp/test_qsa_dcp_packed_cache.py \
+  tests/models/qwen4_exp/test_qsa_metadata_padding.py \
+  tests/distributed/test_dcp_a2a.py \
+  tests/v1/attention/test_gdn_metadata_builder.py \
   tests/models/qwen4_exp/test_sm70_gdn_projection_split.py \
   tests/kernels/test_sm70_gdn_projection_tails.py \
   tests/kernels/test_sm70_qsa_prep.py \
@@ -179,13 +221,16 @@ pytest -q \
   tests/quantization/test_sm70_warmup.py \
   tests/benchmarks/test_sm70_qwen38_baseline.py
 
-# 2. Run reproducible TP4 + MTP4 benchmark (verifies bit-exact greedy token IDs)
+# 2. Run reproducible TP4 + DCP2 benchmark / quality gate
+pytest -q tests/benchmarks/test_qwen38_dcp_quality.py
+
+# 3. Run reproducible TP4 + MTP4 benchmark (verifies bit-exact greedy token IDs)
 python benchmarks/benchmark_sm70_qwen38_baseline.py \
   --model /path/to/Qwen3.8-Flash-Next-NVFP4 \
   --mtp 4 \
   --output /tmp/qwen38_mtp4_opt.json
 
-# 3. Run reproducible TP4 + No-MTP benchmark
+# 4. Run reproducible TP4 + No-MTP benchmark
 python benchmarks/benchmark_sm70_qwen38_baseline.py \
   --model /path/to/Qwen3.8-Flash-Next-NVFP4 \
   --mtp 0 \
