@@ -1160,6 +1160,30 @@ Its defaults are **TP4, FP16 compute/KV, MTP4, 131072 context, 8192-token prefil
 
 The release test machine had ample host RAM: Flash-Next PLE tables alone total approximately **47.68 GiB**, before model mappings, caches and process memory. Low-RAM operation was not qualified by that release test. Later main includes capability-based device/pinned-host/disk PLE placement and packed GGUF lookup; these have their own storage and model-validation conditions ([#806](https://github.com/1CatAI/1Cat-vLLM/pull/806), [#877](https://github.com/1CatAI/1Cat-vLLM/pull/877), [#885](https://github.com/1CatAI/1Cat-vLLM/pull/885)).
 
+### SM70 `Qwen3.8-Flash-Next` (`qwen4_exp`) Prefill, `MTP4`, and `TP4 + DCP2` Decode Optimizations
+
+Complete design notes, bottleneck breakdown, and per-file unified diffs are documented in [`docs/design/sm70_qwen38_prefill_decode_optimizations.md`](docs/design/sm70_qwen38_prefill_decode_optimizations.md):
+
+- **Prefill & `MTP4` Bit-Exact Optimizations (`P1`–`P10`)**:
+  - **`P1` (`qsa_cache.py`, `indexer_qsa.py`, `ops/qsa.py`)**: Cross-layer `visible_blocks_cache` in `QSAForwardMetadata`, eliminating 11/12 `.item()` host–device syncs and `_qsa_visible_blocks_kernel` launches per prefill chunk.
+  - **`P2` (`qsa.py`)**: 3D strided `output_gate` view passthrough (`flatten_gate=False`), eliminating 12–16 `aten::copy_` launches per step and `302 MB` HBM traffic per 8K prefill chunk.
+  - **`P3`–`P4` (`fp4_workspace.py`, `nvfp4_sm70_moe.py`)**: Cached per-device read-only `int32` sequence buffer in `NvFp4MoEWorkspace._eager_buffers` and skipped redundant `output.zero_()`, `permuted_idx.fill_()`, and `topk_ids_i32.copy_()` when `expert_map is None`, saving `2.04 GB` HBM traffic and 240 kernel launches per 8K chunk.
+  - **`P5` (`sm70_fp16_gemv.py`, `qwen_gdn_linear_attn.py`)**: Shrunk `_qwen38_gdn_projection_split_kernel` (`COPY_QKV=False`) grid from `(m, 16)` to `(m, 6)` (**62.5% fewer CTAs**) and enabled it for `M > 1` in `qwen_gdn_input_projection_core`.
+  - **`P6` (`layernorm.py`)**: `@torch.compile(dynamic=True)` `_compiled_rmsnorm_gated_forward_static` inside opaque `qwen_gdn_full_forward` when `MTP4` is enabled and `rows > 192`, eliminating **360 eager FP32 ATen kernel launches and `~27.1 GB` HBM traffic per 8K prefill chunk** across 36 GDN layers.
+  - **`P7` (`llm_base_proposer.py`, `gpu_model_runner.py`)**: Early exit in `SpecDecodeBaseProposer.propose` after `first_forward` when `_is_all_reqs_chunked_prefill()` is `True`, skipping wasted step-0 `lm_head` + sampling, 3 autoregressive MTP decode steps (`spec_step_idx = 1..3`), and D2H copy on intermediate prefill chunks.
+  - **`P8` (`sm70_mtp_fc.py`, `mtp.py`)**: Enabled `maybe_combine_fc` single-AllGather TP-local `fc_embedding + fc_hidden` combine during MTP prefill (saving 1 TP4 AllGather of `40 MB` + `270 MB` HBM traffic per 8K chunk) and preallocated static `topk_indices_buffer` + `DCP2` buffers on `Qwen4ExpMultiTokenPredictor`.
+  - **`P9` (`causal_conv1d.py`)**: Preserved channel-last `(1, dim)` strides when allocating `out` in `causal_conv1d_fn` from sliced views (`mixed_qkvz[:T, :2560].transpose(0, 1)`), eliminating `16 KB`-strided uncoalesced warp stores in `_causal_conv1d_fwd_kernel` and `16 KB`-strided uncoalesced warp loads in `_fused_post_conv_kernel` across all 36 GDN layers.
+  - **`P10` (`ops/hc.py`, `hyperconnection.py`, `model.py`)**: Direct in-place write into `_mtp_hidden_buffer` inside `_hc_combine_norm_impl` on the `_hcx_final_mix` path, eliminating `160 MB` temporary allocation and `320 MB` HBM copy traffic per 8K chunk.
+- **`TP4 + DCP2` Decode Bit-Exact Optimizations (`D1`–`D16`)**:
+  - **`D1` (`dcp_alltoall.py`, `qsa.py`)**: Fused DCP A2A LSE unpack/combine + FP16 rounding + sigmoid output gate directly into `output`.
+  - **`D2` & `D10` (`ops/qsa_dcp.py`, `ops/qsa.py`, `qsa.py`)**: Half-width (`1026` vs. `2051`) output stores and fused physical KV slot resolution (`RESOLVE_PHYSICAL=True`) inside `_qsa_localize_dcp_indices_kernel`.
+  - **`D3`, `D7`, `D8` (`ops/qsa.py`, `ops/qsa_shared_key.py`, `indexer_qsa.py`, `qsa.py`)**: Persistent Split-K, selector, indexer, and DCP `all_gather` workspaces eliminating ~90+ dynamic GPU allocations per decode step.
+  - **`D4`, `D5`, `D6`, `D12` (`qsa.py`, `gdn_attn.py`, `gpu_model_runner.py`, `model_runner.py`, `cudagraph_utils.py`)**: Skipped redundant `output.zero_()` on DCP QSA decode, vectorized replicated-draft block-table expansion, deferred `compute_num_computed_tokens()` across 6 GDN groups on decode, and gated MLA-only `dcp_local_seq_lens` preparation.
+  - **`D9` & `D11` (`qsa_cache.py`, `indexer_qsa.py`, `ops/qsa.py`)**: Dynamic live-context `score_columns` bounding on decode (cutting empty scorer CTAs by 80%–98%), empty-tile short-circuit (`tl.max(logical_token, axis=0) >= 0`) in `_qsa_sparse_paged_gqa_splitk_kernel`, and 2-warp SM70 partial launch for `group_size == 12` (`DCP2`).
+  - **`D13` & `D14` (`ops/qsa.py`, `dcp_alltoall.py`, `qsa.py`)**: Fused Split-K merge + DCP A2A send-buffer pack (`dcp_packed_out`, eliminating 12 `_dcp_a2a_pack_send_kernel` launches/step) and hoisted `qsa_prep_sm70_out` + async `all_gather_into_tensor(query, async_op=True)` overlapped with all 4 Indexer kernels and `qsa_localize_dcp_indices`.
+  - **`D15` (`ple_layer.py`)**: Extended `_qwen38_ple_m1_short_conv_kernel` to a 2D grid `(triton.cdiv(10240, 256), num_rows)` supporting `B >= 1` (`M = 5` in MTP4 verify) and `conv_state.shape[2] >= 9`, plus replaced `torch.zeros_like(normalized)` with `torch.empty_like(normalized)`.
+  - **`D16` (`model.py`, `qwen_gdn_linear_attn.py`)**: Eliminated redundant GDN `attn_buffer` allocation/copy when `output_projection` is disabled, cached empty metadata tensors, bypassed `GdnMetadataOverride` on non-compare decode, wrote `mixed_qkv_recurrence` directly into `core_attn_out`, and enabled `qwen38_sm70_fp16_gdn_input` in `qwen_gdn_input_projection_core`.
+
 ---
 
 # 🔨 Build From Source
