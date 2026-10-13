@@ -18,6 +18,16 @@ from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import 
 
 
 class NvFp4MoEWorkspace:
+    _eager_arange_cache: dict[torch.device, torch.Tensor] = {}
+
+    @classmethod
+    def _get_eager_arange(cls, device: torch.device, length: int) -> torch.Tensor:
+        buf = cls._eager_arange_cache.get(device)
+        if buf is None or buf.numel() < length:
+            buf = torch.arange(length, dtype=torch.int32, device=device)
+            cls._eager_arange_cache[device] = buf
+        return buf
+
     @classmethod
     def allocate(cls, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
@@ -123,9 +133,9 @@ class NvFp4MoEWorkspace:
             "active_expert_ids": layer._nvfp4_sm70_active_expert_ids[:slots],
         }
 
-    @staticmethod
+    @classmethod
     def _eager_buffers(
-        layer: RoutedExperts, num_tokens: int, indexed_w13: bool
+        cls, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
         device = layer.w13_tm_weight.device
         top_k = int(layer.sm70_nvfp4_top_k)
@@ -136,6 +146,7 @@ class NvFp4MoEWorkspace:
         workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
             slots, layer.global_num_experts
         )
+        arange_buf = cls._get_eager_arange(device, slots + 1)
         return {
             "output": torch.empty(
                 num_tokens, hidden, dtype=torch.float16, device=device
@@ -171,9 +182,7 @@ class NvFp4MoEWorkspace:
             "topk_ids": torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
-            "token_expert_indices": torch.arange(
-                slots, dtype=torch.int32, device=device
-            ).view(num_tokens, top_k),
+            "token_expert_indices": arange_buf[:slots].view(num_tokens, top_k),
             "permuted_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "sort_workspace": torch.empty(
                 workspace_size, dtype=torch.int8, device=device
@@ -182,9 +191,7 @@ class NvFp4MoEWorkspace:
             "sorted_row_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "topk_ids_for_sort": torch.empty(slots, dtype=torch.int32, device=device),
             "dense_expert_ids": layer._nvfp4_sm70_dense_expert_ids,
-            "compact_offsets": torch.arange(
-                slots + 1, dtype=torch.int32, device=device
-            ),
+            "compact_offsets": arange_buf[: slots + 1],
             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
         }
 

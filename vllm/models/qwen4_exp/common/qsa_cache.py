@@ -14,7 +14,7 @@ shared by the generic cache-layout planner.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from typing import ClassVar
 
@@ -606,6 +606,9 @@ class QSAForwardMetadata(AttentionMetadata):
     # Host copy of query_start_loc. It lets QSA selection split a mixed batch
     # by request without a device synchronization.
     query_start_loc_cpu: torch.Tensor | None = None
+    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]] = field(
+        default_factory=dict
+    )
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):

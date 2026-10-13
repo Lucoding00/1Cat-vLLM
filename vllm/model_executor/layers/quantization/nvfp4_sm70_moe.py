@@ -1411,10 +1411,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
         else:
-            output.zero_()
-            topk_ids_i32 = buffers["topk_ids"]
-            topk_ids_i32.copy_(topk_ids, non_blocking=True)
-            buffers["permuted_idx"].fill_(slots)
+            if layer.expert_map is not None:
+                output.zero_()
+                buffers["permuted_idx"].fill_(slots)
+            if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
+                topk_ids_i32 = topk_ids
+            else:
+                topk_ids_i32 = buffers["topk_ids"]
+                topk_ids_i32.copy_(topk_ids, non_blocking=True)
             if indexed_w13:
                 self.native_ops.moe_permute_metadata_with_scratch(
                     x,

@@ -5813,7 +5813,7 @@ def qwen_gdn_input_projection_core(
         copied_tails = (
             not self.gqa_interleaved_layout
             and not self.disable_tp_for_ba_proj
-            and mixed_qkvz.shape[0] in (5, 20)
+            and mixed_qkvz.shape[0] > 1
             and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
             and self.value_dim // self.tp_size == 1536
             and z_out.shape == (mixed_qkvz.shape[0], 12, 128)

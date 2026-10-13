@@ -862,6 +862,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self,
         qkv: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        flatten_gate: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split, normalize, and rotate Q/K using this tree's Qwen3 API."""
         q_gate, key, value = qkv.split(
@@ -875,7 +877,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             key.view(*token_shape, self.num_kv_heads, self.head_dim)
         ).reshape(*token_shape, self.kv_size)
         query, key = self.rotary_emb(positions, query, key)
-        return query, key, value, gate.reshape(*token_shape, self.q_size)
+        if flatten_gate:
+            gate = gate.reshape(*token_shape, self.q_size)
+        return query, key, value, gate
 
     def _use_dense_short_context(
         self, num_tokens: int, side_metadata: QSAForwardMetadata
@@ -1043,12 +1047,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             q_gate = qkv[:, : self.q_size * 2].view(
                 num_tokens, self.num_heads, 2 * self.head_dim
             )
-            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            gate = q_gate[..., self.head_dim :]
             query = qkv
             key = value = qkv
             attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
         else:
-            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            q, k, v, gate = self._project_qkv_gate(
+                qkv, positions, flatten_gate=False
+            )
             query = q.view(num_tokens, self.num_heads, self.head_dim)
             key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
             value = v.view(num_tokens, self.num_kv_heads, self.head_dim)

@@ -361,6 +361,7 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
+            visible_blocks_cache=compressed_metadata.visible_blocks_cache,
         )
 
 

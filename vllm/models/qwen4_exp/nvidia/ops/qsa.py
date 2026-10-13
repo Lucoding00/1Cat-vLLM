@@ -1523,6 +1523,8 @@ def _qsa_select_by_request(
     compress_ratio: int,
     out: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
+    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]]
+    | None = None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1565,6 +1567,8 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                visible_blocks_cache=visible_blocks_cache,
+                _cache_row_range=(start, end),
             )
         else:
             qsa_select_paged_tokens(
@@ -1577,6 +1581,8 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                visible_blocks_cache=visible_blocks_cache,
+                _cache_row_range=(start, end),
             )
     return True
 
@@ -1593,6 +1599,9 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
     query_start_loc_cpu: torch.Tensor | None = None,
     shared_key_scoring: bool = False,
+    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]]
+    | None = None,
+    _cache_row_range: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1615,6 +1624,7 @@ def qsa_select_paged_tokens(
         compress_ratio,
         out,
         query_start_loc_cpu,
+        visible_blocks_cache=visible_blocks_cache,
     ):
         return out
 
@@ -1625,19 +1635,34 @@ def qsa_select_paged_tokens(
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
-        all_visible = _qsa_visible_blocks(
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            compress_ratio,
+        start_row, end_row = (
+            _cache_row_range if _cache_row_range is not None else (0, rows)
         )
+        cache_key = (start_row, end_row, int(compress_ratio))
+        cached_visible = (
+            visible_blocks_cache.get(cache_key)
+            if visible_blocks_cache is not None
+            else None
+        )
+        if cached_visible is None:
+            all_visible = _qsa_visible_blocks(
+                token_to_req,
+                query_positions,
+                sequence_lengths,
+                compress_ratio,
+            )
+            max_visible = int(all_visible.max().item())
+            if visible_blocks_cache is not None:
+                visible_blocks_cache[cache_key] = (all_visible, max_visible)
+        else:
+            all_visible, max_visible = cached_visible
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. This is one scalar sync per QSA layer.
+        # model-capacity tail. Cached across QSA layers in the same forward pass.
         score_columns = min(
             capacity_columns,
-            max(block_topk, int(all_visible.max().item())),
+            max(block_topk, max_visible),
         )
         if _qsa_indexer_cublas_work_supported(rows, score_columns):
             logger.info_once(
