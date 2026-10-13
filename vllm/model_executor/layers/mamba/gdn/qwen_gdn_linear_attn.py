@@ -789,28 +789,43 @@ def _qwen_gdn_metadata_tensors(
     return tensors
 
 
+_EMPTY_INT32_BY_DEVICE: dict[torch.device, torch.Tensor] = {}
+
+
+def _empty_int32_tensor(device: torch.device) -> torch.Tensor:
+    tensor = _EMPTY_INT32_BY_DEVICE.get(device)
+    if tensor is None:
+        tensor = torch.empty(0, dtype=torch.int32, device=device)
+        _EMPTY_INT32_BY_DEVICE[device] = tensor
+    return tensor
+
+
 def _qwen_gdn_non_spec_metadata_tensors(
     layer_name: LayerNameType,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    empty = torch.empty(0, dtype=torch.int32, device=device)
     try:
         forward_context = get_forward_context()
     except AssertionError:
+        empty = _empty_int32_tensor(device)
         return empty, empty
     attn_metadata_raw = forward_context.attn_metadata
     if not isinstance(attn_metadata_raw, dict):
+        empty = _empty_int32_tensor(device)
         return empty, empty
     attn_metadata = attn_metadata_raw.get(_resolve_layer_name(layer_name))
     if not isinstance(attn_metadata, GDNAttentionMetadata):
+        empty = _empty_int32_tensor(device)
         return empty, empty
 
-    def _or_empty(tensor: torch.Tensor | None) -> torch.Tensor:
-        return tensor if tensor is not None else empty
-
+    qsl = attn_metadata.non_spec_query_start_loc
+    ssi = attn_metadata.non_spec_state_indices_tensor
+    if qsl is not None and ssi is not None:
+        return qsl, ssi
+    empty = _empty_int32_tensor(device)
     return (
-        _or_empty(attn_metadata.non_spec_query_start_loc),
-        _or_empty(attn_metadata.non_spec_state_indices_tensor),
+        qsl if qsl is not None else empty,
+        ssi if ssi is not None else empty,
     )
 
 
@@ -3090,7 +3105,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if (
                 not self.gqa_interleaved_layout
                 and not self.disable_tp_for_ba_proj
-                and mixed_qkvz.shape[0] in (5, 20)
+                and mixed_qkvz.shape[0] > 1
                 and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
                 and self.value_dim // self.tp_size == 1536
                 and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
@@ -3750,7 +3765,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if (
             self.enable_packed_recurrent_decode
-            and not mixed_qkv_decode_requested
+            and (
+                not mixed_qkv_decode_requested
+                or (
+                    mixed_qkv.is_contiguous()
+                    and not getattr(
+                        self, "compare_sm70_fused_sigmoid_mixed_qkv", False
+                    )
+                )
+            )
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -4003,6 +4026,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.compare_sm70_fused_sigmoid_mixed_qkv
                 and not torch.cuda.is_current_stream_capturing()
             )
+            direct_core_out = (
+                core_attn_out[:num_non_spec_tokens].unsqueeze(1)
+                if not compare_mixed_qkv
+                else None
+            )
             core_attn_out_non_spec, mixed_final_state = mixed_qkv_recurrence(
                 self.gdn_heads,
                 A_log=self.A_log,
@@ -4016,6 +4044,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     : attn_metadata.num_decodes + 1
                 ],
                 state_indices=non_spec_state_indices_tensor[:num_non_spec_tokens],
+                out=direct_core_out,
                 schedule=self.gdn_policy.schedule,
             )
             if compare_mixed_qkv:
@@ -4081,8 +4110,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         "SM70 fused sigmoid mixed-QKV compare matched exactly: "
                         "out_max_diff=0.0 state_max_diff=0.0."
                     )
-                core_attn_out_non_spec = ref_out
-            core_attn_out[:num_non_spec_tokens] = core_attn_out_non_spec.squeeze(0)
+                core_attn_out[:num_non_spec_tokens] = ref_out.squeeze(0)
             return
 
         # The speculative rows are the whole batch, or a subset next to prefill
@@ -4953,7 +4981,10 @@ def qwen_gdn_attention_core_standard_spec(
     if (
         attn_metadata is not None
         and self.enable_packed_recurrent_decode
-        and not mixed_qkv_decode_requested
+        and (
+            not mixed_qkv_decode_requested
+            or not getattr(self, "compare_sm70_fused_sigmoid_mixed_qkv", False)
+        )
         and attn_metadata.spec_sequence_masks is None
         and attn_metadata.num_prefills == 0
         and attn_metadata.num_decodes > 0
@@ -5371,7 +5402,10 @@ def qwen_gdn_attention_core_standard(
     if (
         attn_metadata is not None
         and self.enable_packed_recurrent_decode
-        and not mixed_qkv_decode_requested
+        and (
+            not mixed_qkv_decode_requested
+            or not getattr(self, "compare_sm70_fused_sigmoid_mixed_qkv", False)
+        )
         and attn_metadata.spec_sequence_masks is None
         and attn_metadata.num_prefills == 0
         and attn_metadata.num_decodes > 0
@@ -5795,6 +5829,24 @@ def qwen_gdn_input_projection_core(
             "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         z = z_out
+    elif (
+        getattr(self, "sm70_qwen38_fp16_fused_input", False)
+        and isinstance(self.in_proj_qkvz, LinearBase)
+        and isinstance(self.in_proj_ba, LinearBase)
+        and use_sm70_decode_graph_semantics(
+            getattr(self, "_execution_graph_policy", None)
+        )
+        and not _sm70_gdn_projection_dump_requested(layer_name)
+    ):
+        assert self.in_proj_ba is not None
+        mixed_qkv, z_flat, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
+            hidden_states,
+            self.in_proj_qkvz.weight,
+            self.in_proj_ba.weight,
+            getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_packed", None),
+            getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
+        )
+        z_out.copy_(z_flat.reshape_as(z_out))
     else:
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)

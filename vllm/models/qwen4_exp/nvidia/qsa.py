@@ -268,6 +268,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         dense_short_context: bool = False,
+        dcp_ag_state: Any | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -368,6 +369,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 output[:num_tokens],
                 output_gate[:num_tokens],
+                dcp_ag_state=dcp_ag_state,
             )
             return output
 
@@ -393,17 +395,21 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         return output
 
-    def _all_gather_dcp_query(
+    def _start_all_gather_dcp_query(
         self,
         query: torch.Tensor,
-        group: Any,
-    ) -> torch.Tensor:
+        group: Any | None = None,
+    ) -> tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int]:
+        if group is None:
+            from vllm.distributed import get_dcp_group
+
+            group = get_dcp_group()
         q_contig = query if query.is_contiguous() else query.contiguous()
         device_group = getattr(group, "device_group", None)
         if device_group is None and hasattr(group, "device_communicator"):
             device_group = getattr(group.device_communicator, "device_group", None)
         if device_group is None:
-            return group.all_gather(q_contig, dim=1)
+            return (None, group.all_gather(q_contig, dim=1), None, 0, 0, 0)
         rows, heads, dim = q_contig.shape
         world_size = self.dcp_world_size
         needed = world_size * rows * heads * dim
@@ -424,30 +430,56 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             recv_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
             self._dcp_ag_recv_buffer = recv_buf
         recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
-        torch.distributed.all_gather_into_tensor(
-            recv_view, q_contig, group=device_group
+        out_buf: torch.Tensor | None = None
+        if rows > 1:
+            out_buf = getattr(self, "_dcp_ag_out_buffer", None)
+            if (
+                out_buf is None
+                or out_buf.numel() < needed
+                or out_buf.dtype != q_contig.dtype
+                or out_buf.device != q_contig.device
+            ):
+                cap = 1 << (max(needed, 1) - 1).bit_length()
+                if (
+                    out_buf is not None
+                    and out_buf.device == q_contig.device
+                    and out_buf.dtype == q_contig.dtype
+                ):
+                    cap = max(cap, out_buf.numel())
+                out_buf = torch.empty(
+                    (cap,), dtype=q_contig.dtype, device=q_contig.device
+                )
+                self._dcp_ag_out_buffer = out_buf
+        work = torch.distributed.all_gather_into_tensor(
+            recv_view, q_contig, group=device_group, async_op=True
         )
+        return (work, recv_view, out_buf, rows, heads, dim)
+
+    def _finish_all_gather_dcp_query(
+        self,
+        ag_state: tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int],
+    ) -> torch.Tensor:
+        work, recv_view, out_buf, rows, heads, dim = ag_state
+        if work is None:
+            return recv_view
+        work.wait()
+        world_size = self.dcp_world_size
         if rows == 1:
             return recv_view.view(1, world_size * heads, dim)
-        out_buf = getattr(self, "_dcp_ag_out_buffer", None)
-        if (
-            out_buf is None
-            or out_buf.numel() < needed
-            or out_buf.dtype != q_contig.dtype
-            or out_buf.device != q_contig.device
-        ):
-            cap = 1 << (max(needed, 1) - 1).bit_length()
-            if (
-                out_buf is not None
-                and out_buf.device == q_contig.device
-                and out_buf.dtype == q_contig.dtype
-            ):
-                cap = max(cap, out_buf.numel())
-            out_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
-            self._dcp_ag_out_buffer = out_buf
+        assert out_buf is not None
+        needed = world_size * rows * heads * dim
         out_view = out_buf[:needed].view(rows, world_size, heads, dim)
         out_view.copy_(recv_view.view(world_size, rows, heads, dim).movedim(0, 1))
         return out_view.view(rows, world_size * heads, dim)
+
+    def _all_gather_dcp_query(
+        self,
+        query: torch.Tensor,
+        group: Any,
+    ) -> torch.Tensor:
+        return self._finish_all_gather_dcp_query(
+            self._start_all_gather_dcp_query(query, group)
+        )
 
     def _forward_qsa_dcp(
         self,
@@ -460,9 +492,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor,
+        dcp_ag_state: Any | None = None,
     ) -> None:
         from vllm.distributed import get_dcp_group
-        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            _dcp_a2a_send_recv_buffers,
+            dcp_a2a_lse_reduce,
+        )
 
         from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
         from .ops.qsa_dcp import (
@@ -482,6 +518,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             )
         ):
             raise RuntimeError("QSA DCP target workspaces are not initialized")
+        group = get_dcp_group()
+        if dcp_ag_state is None:
+            dcp_ag_state = self._start_all_gather_dcp_query(query, group)
         # Only this prefix of the compacted columns can hold an owned token.
         local_width = qsa_dcp_local_selection_width(
             layer.indexer.token_topk,
@@ -502,10 +541,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req=token_to_req if resolve_physical else None,
             num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
         )
-        group = get_dcp_group()
-        gathered_query = self._all_gather_dcp_query(query, group)
         partial_output = partial_output_buffer[: query.shape[0]]
         partial_lse = partial_lse_buffer[: query.shape[0]]
+        use_fused_a2a_pack = bool(
+            self.dcp_combine is dcp_a2a_lse_reduce
+            and self.dcp_world_size > 1
+            and partial_output.dtype == torch.float32
+        )
+        send_buffer: torch.Tensor | None = None
+        recv_buffer: torch.Tensor | None = None
+        if use_fused_a2a_pack:
+            send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+                (
+                    self.dcp_world_size,
+                    query.shape[0],
+                    query.shape[1],
+                    query.shape[2] + 1,
+                ),
+                device=partial_output.device,
+                dtype=partial_output.dtype,
+            )
+        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
         qsa_sparse_paged_attention(
@@ -521,6 +577,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             v_scale=layer._v_scale_float,
             lse=partial_lse,
             pre_resolved_indices=resolve_physical,
+            dcp_packed_out=send_buffer,
         )
         gate_view = output_gate.view_as(output)
         if self.dcp_combine is dcp_a2a_lse_reduce:
@@ -531,6 +588,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 is_lse_base_on_e=False,
                 out=output,
                 output_gate=gate_view,
+                packed_send_buffer=send_buffer,
+                recv_buffer=recv_buffer,
             )
             return
         merged = cast(
@@ -1053,23 +1112,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value[:num_tokens],
             )
         dense = self._use_dense_short_context(num_tokens, side_metadata)
-        selected = self.indexer(
-            hidden_states,
-            positions,
-            self.topk_indices_buffer[:num_tokens],
-            select=not dense,
-        )
-        if selected.shape != (
-            num_tokens,
-            self.indexer.output_width,
-        ):
-            raise RuntimeError("QSA indexer returned an invalid selection shape")
-        selected = _sm70_dump_qwen_layer_tensor(
-            "qsa_selected_indices",
-            self.indexer.layer_id,
-            "qsa",
-            selected,
-        )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if self.host_kv_enabled:
             self.host_kv.write(key, value, main_metadata.slot_mapping)
@@ -1135,6 +1177,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache,
                 main_metadata.slot_mapping,
             )
+        dcp_ag_state = None
+        if getattr(self, "qsa_dcp_sharded", False) and num_tokens > 0 and not dense:
+            dcp_ag_state = impl._start_all_gather_dcp_query(query[:num_tokens])
+        selected = self.indexer(
+            hidden_states,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+            select=not dense,
+        )
+        if selected.shape != (
+            num_tokens,
+            self.indexer.output_width,
+        ):
+            raise RuntimeError("QSA indexer returned an invalid selection shape")
+        selected = _sm70_dump_qwen_layer_tensor(
+            "qsa_selected_indices",
+            self.indexer.layer_id,
+            "qsa",
+            selected,
+        )
         impl.forward_qsa(
             self,
             query,
@@ -1148,6 +1210,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             query_positions=side_metadata.logical_positions,
             sequence_lengths=side_metadata.seq_lens,
             dense_short_context=dense,
+            dcp_ag_state=dcp_ag_state,
         )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",

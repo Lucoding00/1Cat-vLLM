@@ -103,6 +103,11 @@ def _lse_weighted_combine(
     return result
 
 
+_DCP_A2A_BUFFERS: dict[
+    tuple[torch.device, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
 def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
     bits = torch.finfo(output_dtype).bits
     if bits == 16:
@@ -123,6 +128,24 @@ def _dcp_a2a_send_recv_buffers(
             (shape, dtype),
         )
         return send_buffer, recv_buffer
+
+    needed = 1
+    for dim in shape:
+        needed *= dim
+    if device.type == "cuda" and not torch.cuda.is_current_stream_capturing():
+        stream_id = torch.cuda.current_stream(device).cuda_stream
+        key = (device, stream_id, dtype)
+        cached = _DCP_A2A_BUFFERS.get(key)
+        if cached is None or cached[0].numel() < needed:
+            cap = 1 << (max(needed, 1) - 1).bit_length()
+            if cached is not None:
+                cap = max(cap, cached[0].numel())
+            cached = (
+                torch.empty((cap,), device=device, dtype=dtype),
+                torch.empty((cap,), device=device, dtype=dtype),
+            )
+            _DCP_A2A_BUFFERS[key] = cached
+        return cached[0][:needed].view(shape), cached[1][:needed].view(shape)
 
     return (
         torch.empty(shape, device=device, dtype=dtype),
@@ -430,6 +453,8 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     out: torch.Tensor | None = None,
     output_gate: torch.Tensor | None = None,
+    packed_send_buffer: torch.Tensor | None = None,
+    recv_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -447,6 +472,10 @@ def dcp_a2a_lse_reduce(
         out: Optional preallocated [B, H/N, D] output buffer
         output_gate: Optional [B, H/N, D] sigmoid gate applied after rounding to
             out.dtype
+        packed_send_buffer: Optional pre-packed [N, B, H/N, D + lse_pack_dim]
+            send buffer written directly by the upstream attention merge kernel
+        recv_buffer: Optional preallocated [N, B, H/N, D + lse_pack_dim] receive
+            buffer paired with packed_send_buffer
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -473,21 +502,23 @@ def dcp_a2a_lse_reduce(
     H_per_rank = H // world_size
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
-    send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
-        (world_size, B, H_per_rank, D + lse_pack_dim),
-        device=cp_attn_out.device,
-        dtype=cp_attn_out.dtype,
-    )
-
-    _dcp_a2a_pack_send(
-        cp_attn_out,
-        cp_attn_lse,
-        send_buffer,
-        world_size,
-        H_per_rank,
-        D,
-        lse_pack_dim,
-    )
+    if packed_send_buffer is not None and recv_buffer is not None:
+        send_buffer = packed_send_buffer
+    else:
+        send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
+            (world_size, B, H_per_rank, D + lse_pack_dim),
+            device=cp_attn_out.device,
+            dtype=cp_attn_out.dtype,
+        )
+        _dcp_a2a_pack_send(
+            cp_attn_out,
+            cp_attn_lse,
+            send_buffer,
+            world_size,
+            H_per_rank,
+            D,
+            lse_pack_dim,
+        )
 
     work = dist.all_to_all_single(
         recv_buffer.view(-1),

@@ -470,7 +470,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
         if self.layer_type == "linear_attention":
+            gdn_policy = getattr(self.linear_attn, "gdn_policy", None)
             use_direct_attention_output = (
+                gdn_policy is not None
+                and not gdn_policy.projection.output_projection
+            ) or (
                 communication_policy().long_prefill_norm
                 and torch.compiler.is_compiling()
             )

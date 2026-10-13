@@ -649,6 +649,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HISTORY_LENGTHS=None,
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
+    dcp_packed_ptr=None,
+    H_PER_RANK: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -806,44 +808,63 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
-        if final_lse_ptr is not None:
+        if final_lse_ptr is not None or dcp_packed_ptr is not None:
             lse = tl.where(
                 has_values,
                 max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
                 -float("inf"),
             )
-            tl.store(
-                final_lse_ptr + row * NUM_QUERY_HEADS + first_head + head_offsets,
-                lse,
-                mask=head_offsets < GROUP_SIZE,
-            )
+            if dcp_packed_ptr is None:
+                tl.store(
+                    final_lse_ptr + row * NUM_QUERY_HEADS + first_head + head_offsets,
+                    lse,
+                    mask=head_offsets < GROUP_SIZE,
+                )
         if KV_E4M3:
             # V dequantization is linear, so apply its scalar after the
             # normalized FP32 accumulation instead of to every loaded value.
             normalized_output *= v_scale
-        if output_gate_ptr is not None:
-            # Preserve the compiled path's rounded attention output before
-            # evaluating the sigmoid gate and final product in FP32.
-            normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
-            output_gate = tl.load(
-                output_gate_ptr
-                + row * stride_output_gate_row
-                + (first_head + head_offsets[:, None]) * stride_output_gate_head
-                + dim_offsets[None, :],
+        if dcp_packed_ptr is not None:
+            heads = first_head + head_offsets
+            rank_idx = heads // H_PER_RANK
+            local_head = heads % H_PER_RANK
+            packed_base = (
+                (rank_idx * num_rows + row) * H_PER_RANK + local_head
+            ) * (HEAD_DIM + 1)
+            tl.store(
+                dcp_packed_ptr + packed_base[:, None] + dim_offsets[None, :],
+                normalized_output,
                 mask=output_mask,
-                other=0.0,
-            ).to(tl.float32)
-            normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
-                output_gate
             )
-        tl.store(
-            output_ptr
-            + row * stride_output_row
-            + (first_head + head_offsets[:, None]) * stride_output_head
-            + dim_offsets[None, :],
-            normalized_output,
-            mask=output_mask,
-        )
+            tl.store(
+                dcp_packed_ptr + packed_base + HEAD_DIM,
+                lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
+        else:
+            if output_gate_ptr is not None:
+                # Preserve the compiled path's rounded attention output before
+                # evaluating the sigmoid gate and final product in FP32.
+                normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
+                output_gate = tl.load(
+                    output_gate_ptr
+                    + row * stride_output_gate_row
+                    + (first_head + head_offsets[:, None]) * stride_output_gate_head
+                    + dim_offsets[None, :],
+                    mask=output_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
+                    output_gate
+                )
+            tl.store(
+                output_ptr
+                + row * stride_output_row
+                + (first_head + head_offsets[:, None]) * stride_output_head
+                + dim_offsets[None, :],
+                normalized_output,
+                mask=output_mask,
+            )
     else:
         partial_lse = tl.where(
             has_values,
@@ -890,6 +911,8 @@ def _qsa_merge_splitk_kernel(
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
     KV_E4M3: tl.constexpr,
+    dcp_packed_ptr=None,
+    H_PER_RANK: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -906,13 +929,14 @@ def _qsa_merge_splitk_kernel(
     shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
     weights = tl.math.exp2(shifted)
     denominator = tl.sum(weights, axis=0)
-    if final_lse_ptr is not None:
+    if final_lse_ptr is not None or dcp_packed_ptr is not None:
         merged_lse = tl.where(
             has_values,
             lse_max + tl.math.log2(tl.maximum(denominator, 1.0e-20)),
             -float("inf"),
         )
-        tl.store(final_lse_ptr + row * NUM_QUERY_HEADS + head, merged_lse)
+        if dcp_packed_ptr is None:
+            tl.store(final_lse_ptr + row * NUM_QUERY_HEADS + head, merged_lse)
     partial_output = tl.load(
         partial_output_ptr
         + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head)
@@ -927,19 +951,31 @@ def _qsa_merge_splitk_kernel(
         # Apply the V scale once after combining all independently normalized
         # splits. Scaling partials earlier would repeat this work per split.
         merged *= v_scale
-    if output_gate_ptr is not None:
-        merged = merged.to(output_ptr.dtype.element_ty)
-        output_gate = tl.load(
-            output_gate_ptr
-            + row * stride_output_gate_row
-            + head * stride_output_gate_head
-            + dim_offsets
-        ).to(tl.float32)
-        merged = merged.to(tl.float32) * tl.sigmoid(output_gate)
-    tl.store(
-        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
-        merged,
-    )
+    if dcp_packed_ptr is not None:
+        rank_idx = head // H_PER_RANK
+        local_head = head % H_PER_RANK
+        packed_base = (
+            (rank_idx * num_rows + row) * H_PER_RANK + local_head
+        ) * (HEAD_DIM + 1)
+        tl.store(dcp_packed_ptr + packed_base + dim_offsets, merged)
+        tl.store(dcp_packed_ptr + packed_base + HEAD_DIM, merged_lse)
+    else:
+        if output_gate_ptr is not None:
+            merged = merged.to(output_ptr.dtype.element_ty)
+            output_gate = tl.load(
+                output_gate_ptr
+                + row * stride_output_gate_row
+                + head * stride_output_gate_head
+                + dim_offsets
+            ).to(tl.float32)
+            merged = merged.to(tl.float32) * tl.sigmoid(output_gate)
+        tl.store(
+            output_ptr
+            + row * stride_output_row
+            + head * stride_output_head
+            + dim_offsets,
+            merged,
+        )
 
 
 @triton.jit
@@ -2548,6 +2584,7 @@ def qsa_sparse_paged_attention(
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
     pre_resolved_indices: bool = False,
+    dcp_packed_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2613,6 +2650,25 @@ def qsa_sparse_paged_attention(
             raise ValueError(
                 "QSA DCP must apply its gate after merging partial outputs"
             )
+    if dcp_packed_out is not None:
+        if lse is None:
+            raise ValueError("QSA DCP packed output requires LSE")
+        if (
+            dcp_packed_out.ndim != 4
+            or dcp_packed_out.dtype != torch.float32
+            or dcp_packed_out.device != q.device
+            or not dcp_packed_out.is_contiguous()
+            or dcp_packed_out.shape[1] != q.shape[0]
+            or dcp_packed_out.shape[0] * dcp_packed_out.shape[2] != q.shape[1]
+            or dcp_packed_out.shape[3] != head_dim + 1
+        ):
+            raise ValueError(
+                "QSA DCP packed output must be contiguous FP32 "
+                "[world_size, rows, heads_per_rank, head_dim + 1]"
+            )
+    dcp_h_per_rank = (
+        dcp_packed_out.shape[2] if dcp_packed_out is not None else q.shape[1]
+    )
     output_gate_view = output_gate.view_as(q) if output_gate is not None else None
     if output_gate_view is not None:
         if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
@@ -2747,6 +2803,8 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        dcp_packed_ptr=dcp_packed_out,
+        H_PER_RANK=dcp_h_per_rank,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -2770,6 +2828,8 @@ def qsa_sparse_paged_attention(
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
         KV_E4M3=kv_e4m3,
+        dcp_packed_ptr=dcp_packed_out,
+        H_PER_RANK=dcp_h_per_rank,
         num_warps=2,
         num_stages=1,
     )

@@ -317,16 +317,17 @@ def _qwen38_ple_m1_short_conv_kernel(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Fuse exact Qwen3.8 M=1 dilated conv and state-cache update."""
+    """Fuse exact Qwen3.8 decode dilated conv and state-cache update."""
 
     hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.program_id(1).to(tl.int64)
     hidden_mask = hidden < HIDDEN_SIZE
-    state_index = tl.load(state_index_ptr).to(tl.int64)
+    state_index = tl.load(state_index_ptr + row).to(tl.int64)
     valid = state_index != NULL_STATE_ID
     safe_state_index = tl.where(valid, state_index, 0)
     use_initial = valid
     if HAS_INITIAL:
-        use_initial &= tl.load(has_initial_ptr).to(tl.int1)
+        use_initial &= tl.load(has_initial_ptr + row).to(tl.int1)
     state_base = safe_state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
     state_mask = hidden_mask & use_initial
 
@@ -371,7 +372,8 @@ def _qwen38_ple_m1_short_conv_kernel(
         mask=state_mask,
         other=0.0,
     ).to(tl.float32)
-    x = tl.load(x_ptr + hidden, mask=hidden_mask, other=0.0).to(tl.float32)
+    row_offset = row * HIDDEN_SIZE + hidden
+    x = tl.load(x_ptr + row_offset, mask=hidden_mask, other=0.0).to(tl.float32)
     w0 = tl.load(weight_ptr + hidden * 4).to(tl.float32)
     w1 = tl.load(weight_ptr + hidden * 4 + 1).to(tl.float32)
     w2 = tl.load(weight_ptr + hidden * 4 + 2).to(tl.float32)
@@ -384,7 +386,11 @@ def _qwen38_ple_m1_short_conv_kernel(
     # retains native F.silu because its SM70 rounding differs slightly from
     # Triton's sigmoid approximation.
     conv = conv.to(tl.float16)
-    tl.store(output_ptr + hidden, tl.where(valid, conv, 0.0), mask=hidden_mask)
+    tl.store(
+        output_ptr + row_offset,
+        tl.where(valid, conv, 0.0),
+        mask=hidden_mask,
+    )
 
     update_mask = hidden_mask & valid
     tl.store(state_ptr + state_base, s1, mask=update_mask)
@@ -2215,27 +2221,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         state_indices_tensor_d: torch.Tensor,
         has_initial_states_d: torch.Tensor | None,
     ) -> torch.Tensor:
+        num_rows = x_d.shape[0] if x_d.ndim == 2 else 0
         has_initial_ok = has_initial_states_d is None or (
-            has_initial_states_d.numel() >= 1
+            has_initial_states_d.numel() >= num_rows
             and has_initial_states_d.is_cuda
             and has_initial_states_d.is_contiguous()
         )
         if (
             current_platform.is_device_capability((7, 0))
-            and x_d.shape == (1, 10240)
+            and x_d.ndim == 2
+            and num_rows >= 1
+            and x_d.shape[1] == 10240
             and x_d.dtype == torch.float16
             and x_d.is_cuda
             and x_d.is_contiguous()
+            and getattr(self, "conv_state_len", 9) == 9
+            and getattr(self, "short_conv_dilation", 3) == 3
             and conv_state.ndim == 3
             and conv_state.shape[1] == 10240
-            and conv_state.shape[2] == 9
+            and conv_state.shape[2] >= 9
             and conv_state.dtype == torch.float16
             and conv_state.is_cuda
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
             and conv_weights.is_cuda
             and conv_weights.is_contiguous()
-            and state_indices_tensor_d.numel() == 1
+            and state_indices_tensor_d.numel() >= num_rows
             and state_indices_tensor_d.dtype in (torch.int32, torch.int64)
             and state_indices_tensor_d.is_cuda
             and state_indices_tensor_d.is_contiguous()
@@ -2255,7 +2266,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 if has_initial_states_d is None
                 else has_initial_states_d
             )
-            _qwen38_ple_m1_short_conv_kernel[(triton.cdiv(10240, 256),)](
+            _qwen38_ple_m1_short_conv_kernel[(triton.cdiv(10240, 256), num_rows)](
                 x_d,
                 conv_state,
                 conv_weights,
@@ -2799,7 +2810,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             inputs,
             layer_attn_metadata,
             conv_state,
-            conv_weights.to(dtype=inputs.dtype),
+            (
+                conv_weights
+                if conv_weights.dtype == inputs.dtype
+                else conv_weights.to(dtype=inputs.dtype)
+            ),
         )
 
     def forward(
@@ -2850,7 +2865,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         normalized = snapshot_ple_diagnostic(
             normalized, self.prefix + ":07_conv_input", diagnostic
         )
-        conv_output = torch.zeros_like(normalized)
+        conv_output = torch.empty_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
             conv_output,
@@ -2869,7 +2884,11 @@ def qwen4_exp_ple_short_conv(
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
     result = layer._short_conv(inputs)
-    output[: result.shape[0]].copy_(result)
+    active_rows = result.shape[0]
+    if active_rows:
+        output[:active_rows].copy_(result)
+    if active_rows < output.shape[0]:
+        output[active_rows:].zero_()
 
 
 def qwen4_exp_ple_short_conv_fake(
