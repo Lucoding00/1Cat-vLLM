@@ -314,9 +314,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
-        key_cache, value_cache = kv_cache.unbind(1)
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        kv_cache_key = (kv_cache.data_ptr(), kv_cache.shape, kv_cache.stride())
+        if getattr(self, "_cached_kv_unbind_key", None) == kv_cache_key:
+            key_cache, value_cache = self._cached_kv_unbind_pair
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache = canonicalize_singleton_dim_strides(key_cache)
+            value_cache = canonicalize_singleton_dim_strides(value_cache)
+            self._cached_kv_unbind_key = kv_cache_key
+            self._cached_kv_unbind_pair = (key_cache, value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
@@ -387,6 +393,62 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         return output
 
+    def _all_gather_dcp_query(
+        self,
+        query: torch.Tensor,
+        group: Any,
+    ) -> torch.Tensor:
+        q_contig = query if query.is_contiguous() else query.contiguous()
+        device_group = getattr(group, "device_group", None)
+        if device_group is None and hasattr(group, "device_communicator"):
+            device_group = getattr(group.device_communicator, "device_group", None)
+        if device_group is None:
+            return group.all_gather(q_contig, dim=1)
+        rows, heads, dim = q_contig.shape
+        world_size = self.dcp_world_size
+        needed = world_size * rows * heads * dim
+        recv_buf = getattr(self, "_dcp_ag_recv_buffer", None)
+        if (
+            recv_buf is None
+            or recv_buf.numel() < needed
+            or recv_buf.dtype != q_contig.dtype
+            or recv_buf.device != q_contig.device
+        ):
+            cap = 1 << (max(needed, 1) - 1).bit_length()
+            if (
+                recv_buf is not None
+                and recv_buf.device == q_contig.device
+                and recv_buf.dtype == q_contig.dtype
+            ):
+                cap = max(cap, recv_buf.numel())
+            recv_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
+            self._dcp_ag_recv_buffer = recv_buf
+        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
+        torch.distributed.all_gather_into_tensor(
+            recv_view, q_contig, group=device_group
+        )
+        if rows == 1:
+            return recv_view.view(1, world_size * heads, dim)
+        out_buf = getattr(self, "_dcp_ag_out_buffer", None)
+        if (
+            out_buf is None
+            or out_buf.numel() < needed
+            or out_buf.dtype != q_contig.dtype
+            or out_buf.device != q_contig.device
+        ):
+            cap = 1 << (max(needed, 1) - 1).bit_length()
+            if (
+                out_buf is not None
+                and out_buf.device == q_contig.device
+                and out_buf.dtype == q_contig.dtype
+            ):
+                cap = max(cap, out_buf.numel())
+            out_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
+            self._dcp_ag_out_buffer = out_buf
+        out_view = out_buf[:needed].view(rows, world_size, heads, dim)
+        out_view.copy_(recv_view.view(world_size, rows, heads, dim).movedim(0, 1))
+        return out_view.view(rows, world_size * heads, dim)
+
     def _forward_qsa_dcp(
         self,
         layer: torch.nn.Module,
@@ -428,6 +490,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer.cp_kv_cache_interleave_size,
             logical_indices.shape[1],
         )
+        resolve_physical = bool(key_cache.shape[0] * key_cache.shape[1] < 2**31)
         local_indices = qsa_localize_dcp_indices(
             logical_indices,
             local_indices_buffer[: query.shape[0], :local_width],
@@ -435,9 +498,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             dcp_rank=self.dcp_rank,
             interleave_size=layer.cp_kv_cache_interleave_size,
             local_block_size=key_cache.shape[1],
+            block_table=block_table if resolve_physical else None,
+            token_to_req=token_to_req if resolve_physical else None,
+            num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
         )
         group = get_dcp_group()
-        gathered_query = group.all_gather(query.contiguous(), dim=1)
+        gathered_query = self._all_gather_dcp_query(query, group)
         partial_output = partial_output_buffer[: query.shape[0]]
         partial_lse = partial_lse_buffer[: query.shape[0]]
         if partial_output.shape != gathered_query.shape:
@@ -454,6 +520,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             lse=partial_lse,
+            pre_resolved_indices=resolve_physical,
         )
         gate_view = output_gate.view_as(output)
         if self.dcp_combine is dcp_a2a_lse_reduce:
@@ -1008,12 +1075,48 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.host_kv.write(key, value, main_metadata.slot_mapping)
         elif query.dim() == 2:
             # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
-            key_cache, value_cache = self.kv_cache.unbind(1)
-            prepared = query.new_empty((num_tokens, self.num_heads, self.head_dim))
-            text_positions = positions[0] if positions.dim() == 2 else positions
+            kv_cache_key = (
+                self.kv_cache.data_ptr(),
+                self.kv_cache.shape,
+                self.kv_cache.stride(),
+            )
+            if getattr(self, "_cached_raw_kv_unbind_key", None) == kv_cache_key:
+                key_cache, value_cache = self._cached_raw_kv_unbind_pair
+            else:
+                key_cache, value_cache = self.kv_cache.unbind(1)
+                self._cached_raw_kv_unbind_key = kv_cache_key
+                self._cached_raw_kv_unbind_pair = (key_cache, value_cache)
+            needed_q = num_tokens * self.num_heads * self.head_dim
+            prep_buf = getattr(self, "_prepared_q_buffer", None)
+            if (
+                prep_buf is None
+                or prep_buf.numel() < needed_q
+                or prep_buf.dtype != query.dtype
+                or prep_buf.device != query.device
+            ):
+                cap = 1 << (max(needed_q, 1) - 1).bit_length()
+                if (
+                    prep_buf is not None
+                    and prep_buf.device == query.device
+                    and prep_buf.dtype == query.dtype
+                ):
+                    cap = max(cap, prep_buf.numel())
+                prep_buf = torch.empty((cap,), dtype=query.dtype, device=query.device)
+                self._prepared_q_buffer = prep_buf
+            prepared = prep_buf[:needed_q].view(
+                num_tokens, self.num_heads, self.head_dim
+            )
+            text_positions = (positions[0] if positions.dim() == 2 else positions)[
+                :num_tokens
+            ]
+            if text_positions.dtype != torch.int64:
+                text_positions = text_positions.to(torch.int64)
+            slot_mapping = main_metadata.slot_mapping[:num_tokens]
+            if slot_mapping.dtype != torch.int64:
+                slot_mapping = slot_mapping.to(torch.int64)
             torch.ops._C.qsa_prep_sm70_out(
                 query[:num_tokens],
-                text_positions[:num_tokens].to(torch.int64),
+                text_positions,
                 self.rotary_emb.cos_sin_cache,
                 self.q_norm.weight,
                 self.k_norm.weight,
@@ -1021,7 +1124,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 prepared,
                 key_cache,
                 value_cache,
-                main_metadata.slot_mapping[:num_tokens].to(torch.int64),
+                slot_mapping,
             )
             query = key = value = prepared
         else:

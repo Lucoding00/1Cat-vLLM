@@ -5293,7 +5293,7 @@ class GPUModelRunner(
             ]
             return current_mamba_state_block_ids_by_gid[kv_cache_gid]
 
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 and self.model_config.is_deepseek_mla:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                 self.optimistic_seq_lens_cpu[:num_reqs],
                 self.dcp_world_size,

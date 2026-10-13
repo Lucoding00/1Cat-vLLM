@@ -809,7 +809,9 @@ def prepare_inputs_to_capture(
     )
 
     # HACK(woosuk): Special handling for DCP.
-    if block_tables.cp_size > 1:
+    if block_tables.cp_size > 1 and any(
+        ag.backend.is_mla() for group in attn_groups for ag in group
+    ):
         prepare_dcp_local_seq_lens(
             input_buffers.dcp_local_seq_lens,
             input_batch.seq_lens,

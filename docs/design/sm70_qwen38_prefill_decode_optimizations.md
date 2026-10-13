@@ -163,17 +163,12 @@ Under **`TP4 + DCP2`** (`--tensor-parallel-size 4 --decode-context-parallel-size
 | **D4** | **Skip Full-Buffer `output.zero_()` on DCP QSA Decode** | `vllm/models/qwen4_exp/nvidia/qsa.py` | `forward_qsa` called `output.zero_()` on the entire buffer for all non-host-KV layers, even though `_forward_qsa_dcp` (`qsa_dcp_sharded=True`) unconditionally overwrites every active row `output[:num_tokens]` (including empty selections). | Extended the padding-only zero guard to `qsa_dcp_sharded`, only zeroing `output[num_tokens:]` when `num_tokens < output.shape[0]` (eliminating **12 `zero_()` kernel launches per decode step** when unpadded). | **Yes (100% bitwise identical)** |
 | **D5** | **Vectorized Replicated-Draft Block-Table Expansion in `DCP2`** | `vllm/models/qwen4_exp/nvidia/qsa.py` | `Qwen4ExpQSAMetadataBuilder.build` expanded the replicated MTP draft layer's block table via a Python `for sub_block in range(expansion):` loop, launching `2 * expansion` small strided elementwise kernels per step. | Replaced the Python loop with a single broadcasted `torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)` + `expanded_view.add_(sub_block_offsets)` over a cached `(1, 1, expansion)` offset tensor. | **Yes (100% bitwise identical)** |
 | **D6** | **Lazy `compute_num_computed_tokens()` across 6 GDN Groups on Decode** | `vllm/v1/attention/backends/gdn_attn.py` | Because `TP4 + DCP2` packs 2 QSA layers per physical page, the 36 GDN layers are partitioned into **6 GDN KV-cache groups** (vs. 3 at `DCP1`). `GDNAttentionMetadataBuilder.build` unconditionally called `m.compute_num_computed_tokens()` (`torch.diff(query_start_loc)` + `seq_lens - query_len`), even though `context_lens_tensor` is only read inside `if num_prefills > 0:`. | Moved `context_lens_tensor = m.compute_num_computed_tokens()` inside `if num_prefills > 0:`, eliminating **12 wasted GPU kernel launches and 12 tensor allocations per decode step** (and up to 60 in uncached MTP4 fallback builds). | **Yes (100% bitwise identical)** |
-
-### 5.2 Phase-2 `TP4 + DCP2` Decode Optimization Opportunities (Next Steps)
-
-1. **Extend `_sm70_qsa_prep` C++ Fused Prep Kernel to `fp8_e4m3` KV Cache (`csrc/sm70_turbomind/ops/qsa_prep_sm70.cu`, `vllm/models/qwen4_exp/nvidia/qsa.py:598-606`)**:
-   - Under `--kv-cache-dtype auto` without MTP (or when calibrated E4M3 scales are present in the checkpoint), `cache_config.cache_dtype` resolves to `"fp8_e4m3"` (`vllm/models/qwen4_exp/nvidia/qsa.py:486`).
-   - Currently `_sm70_qsa_prep` only admits `cache_config.cache_dtype in ("auto", "float16")` (`qsa.py:604`), so under calibrated `fp8_e4m3` KV cache, QSA falls back to separate `q_norm`, `k_norm`, `apply_rotary_emb_ inplace`, and `reshape_and_cache_flash` kernels (`~6` extra kernels per QSA layer = `72` kernels/step). Adding E4M3 quantization (`k_scale`, `v_scale`) to `qsa_prep_sm70.cu`'s KV cache write epilogue will restore the single-launch fused QSA prep path for E4M3 KV caches.
-2. **SM70 Two-Warp Partial & Native XQA Decode Support for `DCP2` `group_size = 12` (`vllm/models/qwen4_exp/nvidia/ops/qsa.py:2513, 2608`, `flash-attention-v100/kernel/flash_decode_paged.cu`)**:
-   - At `TP4 + DCP1`, each rank has `6` Q heads and `1` KV head (`group_size = 6`, `block_m = 8`), which hits both the native Flash-V100 `decode_paged_xqa_fwd` (`q.shape[1:] == (6, 256)`) and `_use_sm70_qsa_two_warp_partial` (`group_size == 6`).
-   - At `TP4 + DCP2`, `gathered_query` has `12` Q heads and `1` KV head (`group_size = 12`, `block_m = 16`), which bypasses `decode_paged_xqa_fwd` (also because `lse` is required) and uses `partial_warps = 4, target_splits = 64` in `_qsa_sparse_paged_gqa_splitk_kernel`. Adding a `group_size = 12` (`H=12, D=256`) LSE-emitting specialization to `flash_decode_paged.cu` (or tuning `target_splits = 32, partial_warps = 2` for `local_width = 1026` on V100) can cut `TP4 + DCP2` sparse attention kernel time by ~20–30%.
-3. **Eliminate Unused `prepare_dcp_local_seq_lens` Launch When Only QSA Uses DCP (`vllm/v1/worker/gpu/model_runner.py:1090`, `vllm/v1/worker/gpu/cudagraph_utils.py:813`)**:
-   - `ModelRunnerV2` launches `prepare_dcp_local_seq_lens` on every step when `self.use_dcp` is `True`, even though `Qwen4ExpQSAMetadataBuilder` sets `builds_dcp_context_lens = False` and only `MLAAttentionMetadataBuilder` reads `common_attn_metadata.dcp_local_seq_lens`. Gating `prepare_dcp_local_seq_lens` on whether any attention group requires `dcp_local_seq_lens` saves 1 extra Triton kernel launch per step.
+| **D7** | **Persistent QSA Selector, Indexer & Prep Workspaces in Opaque Custom Op** | `vllm/models/qwen4_exp/nvidia/ops/qsa.py`, `ops/qsa_shared_key.py`, `indexer_qsa.py`, `qsa.py` | Because `qwen4_exp_qsa_with_output` is an opaque custom op outside Inductor's memory pool, every QSA layer (`12` target + `1..4` draft) dynamically allocated `scores`/`logits`, `visible_blocks`, `blocks_buffer`, `indexer.q`, and `prepared` query tensors, plus repeated `kv_cache.unbind(1)` and `.to(torch.int64)` calls. | Added `_qsa_selector_workspace`, persistent `_q_buffer` in `QSAIndexer`, persistent `_prepared_q_buffer` + cached `kv_cache.unbind(1)` + dtype-guarded `.to(torch.int64)` in `Qwen4ExpQSAAttention`, eliminating **~65 dynamic GPU allocations per decode step**. | **Yes (100% bitwise identical)** |
+| **D8** | **Zero-Allocation / Zero-Copy DCP Query `all_gather`** | `vllm/models/qwen4_exp/nvidia/qsa.py` | `group.all_gather(query.contiguous(), dim=1)` went through `torch.ops.vllm.all_gather` custom-op boxing, dynamically allocated `output_tensor` on every layer, and for `B > 1` (e.g. `B = 5` in MTP4 verify) `.movedim(0, 1).reshape(...)` allocated a second tensor and launched an `aten::copy_` transpose kernel. | Added `_all_gather_dcp_query` backed by persistent `_dcp_ag_recv_buffer` and `_dcp_ag_out_buffer` calling `dist.all_gather_into_tensor` directly: zero-copy view at `B == 1`, zero dynamic allocations at `B > 1`. | **Yes (100% bitwise identical)** |
+| **D9** | **Dynamic Live-Context `score_columns` Bounding on Decode** | `vllm/models/qwen4_exp/common/qsa_cache.py`, `nvidia/indexer_qsa.py`, `nvidia/ops/qsa.py` | On decode (`not _use_sm70_qsa_indexer_cublas`), `qsa_select_paged_tokens` set `score_columns = capacity_columns` (the full `max_model_len` table width, e.g. `65,600` columns at 256K), launching `2,050` CTAs per QSA layer in `mqa_multiquery` / `_qsa_mqa_paged_kernel` even when active `seq_len` was only 4K–8K (`32–64` active CTAs). | Propagated `max_seq_len` on `QSAForwardMetadata` and added `_qsa_bounded_decode_score_columns` to bound `score_columns` to `min(capacity_columns, max(block_topk, ceil(bound_seq_len // compress_ratio, 64)))` in eager/piecewise and context-bucketed FULL graph modes, cutting empty scorer CTAs by **80%–98%** on short/medium context decode. | **Yes (100% bitwise identical)** |
+| **D10** | **Fused Physical Page Resolution in `qsa_localize_dcp_indices`** | `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py`, `nvidia/ops/qsa.py`, `nvidia/qsa.py` | `_qsa_localize_dcp_indices_kernel` wrote rank-local logical token IDs, requiring all 64 split CTAs of `_qsa_sparse_paged_gqa_splitk_kernel` to load `block_table` from global memory on every tile. | Added `RESOLVE_PHYSICAL: tl.constexpr` to `_localize_indices` so physical KV slots (`physical_page * PAGE_SIZE + page_offset`) are resolved in registers during DCP index localization and consumed with `RESOLVED_INDICES=True` in `qsa_sparse_paged_attention` with zero extra kernel launches. | **Yes (100% bitwise identical)** |
+| **D11** | **Empty-Tile Short-Circuit + Two-Warp `G=12` Launch in Sparse Attention** | `vllm/models/qwen4_exp/nvidia/ops/qsa.py` | In `_qsa_sparse_paged_gqa_splitk_kernel`, compacted DCP2 selections leave trailing tiles filled with `-1`, yet empty tiles still executed masked `k_cache`/`v_cache` loads and 2× Tensor Core `tl.dot` MMAs; additionally `_use_sm70_qsa_two_warp_partial` only admitted `group_size == 6` (`DCP1`) and excluded `group_size == 12` (`DCP2`). | Guarded the tile loop body with `if tl.max(logical_token, axis=0) >= 0:` to skip KV loads and both MMAs on empty tiles, and extended `_use_sm70_qsa_two_warp_partial` to `group_size in (6, 12)` so `TP4 + DCP2` uses the 2-warp SM70 partial launch. | **Yes (100% bitwise identical)** |
+| **D12** | **Skip MLA-Only `dcp_local_seq_lens` Preparation on `Qwen4Exp`** | `vllm/v1/worker/gpu_model_runner.py`, `vllm/v1/worker/gpu/model_runner.py`, `vllm/v1/worker/gpu/cudagraph_utils.py` | When `dcp_world_size > 1`, `ModelRunnerV1` computed and H2D-copied `dcp_local_seq_lens` (and `SpecDecodeBaseProposer` cloned it on GPU) and `ModelRunnerV2` launched `_dcp_local_seq_lens_kernel` on every step, even though only `MLAAttentionMetadataBuilder` reads `dcp_local_seq_lens`. | Gated `dcp_local_seq_lens` preparation on `is_deepseek_mla` / `ag.backend.is_mla()`, eliminating wasted CPU work, H2D copies, Triton kernel launches, and MTP `.clone()` calls on `TP4 + DCP2`. | **Yes (100% bitwise identical)** |
 
 ---
 
@@ -211,11 +206,13 @@ pytest -q \
   tests/models/qwen4_exp/test_qsa_dcp_attention.py \
   tests/models/qwen4_exp/test_qsa_dcp_packed_cache.py \
   tests/models/qwen4_exp/test_qsa_metadata_padding.py \
+  tests/models/qwen4_exp/test_qsa_ops.py \
   tests/distributed/test_dcp_a2a.py \
   tests/v1/attention/test_gdn_metadata_builder.py \
   tests/models/qwen4_exp/test_sm70_gdn_projection_split.py \
   tests/kernels/test_sm70_gdn_projection_tails.py \
   tests/kernels/test_sm70_qsa_prep.py \
+  tests/kernels/test_sm70_qsa_shared_key.py \
   tests/quantization/test_sm70_fp4_mainflow.py \
   tests/quantization/test_sm70_nvfp4_integration.py \
   tests/quantization/test_sm70_warmup.py \
@@ -239,9 +236,11 @@ python benchmarks/benchmark_sm70_qwen38_baseline.py \
 
 ---
 
-## 8. File-by-File Code Modification Details (`be3722b..2b06ade`)
+## 8. File-by-File Code Modification Details (`be3722b..HEAD`)
 
-Below is the complete diff and explanation for every modified file across Phase-1 (`d68b5b3`) and the `TP4 + DCP2` Decode optimizations (`2b06ade`).
+Below is the complete unified diff and explanation for every modified file across Phase-1 (`d68b5b3`) and the `TP4 + DCP2` Decode optimizations (`D1`–`D12`).
+
+---
 
 ### 8.1 `vllm/v1/attention/ops/dcp_alltoall.py` (Optimization D1: Fused DCP A2A Unpack + LSE Combine + FP16 Round + Sigmoid Gate)
 
@@ -367,7 +366,21 @@ index 1469a5c..5fc18b2 100644
 +    out: torch.Tensor | None = None,
 +    output_gate: torch.Tensor | None = None,
  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-...
+     """
+     Combine partial attention outputs across DCP ranks using All-to-All.
+@@ -411,6 +444,9 @@ def dcp_a2a_lse_reduce(
+         ctx: CPTritonContext (unused, for signature compatibility)
+         return_lse: If True, also return the combined global LSE
+         is_lse_base_on_e: If True, LSE is base e; if False, base 2
++        out: Optional preallocated [B, H/N, D] output buffer
++        output_gate: Optional [B, H/N, D] sigmoid gate applied after rounding to
++            out.dtype
+
+     Returns:
+         Combined output [B, H/N, D] (head-scattered)
+@@ -419,9 +455,17 @@ def dcp_a2a_lse_reduce(
+     world_size = cp_group.world_size
+
      if world_size == 1:
 +        result = cp_attn_out
 +        if out is not None:
@@ -382,7 +395,12 @@ index 1469a5c..5fc18b2 100644
 -        return cp_attn_out
 +            return result, cp_attn_lse
 +        return result
-...
+
+     B, H, D = cp_attn_out.shape
+     if H % world_size != 0:
+@@ -454,5 +498,11 @@ def dcp_a2a_lse_reduce(
+     work.wait()
+
      return _dcp_a2a_unpack_combine(
 -        recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
 +        recv_buffer,
@@ -397,24 +415,69 @@ index 1469a5c..5fc18b2 100644
 
 ---
 
-### 8.2 `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py` (Optimization D2: Half-Width Output Write in `qsa_localize_dcp_indices`)
+### 8.2 `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py` (Optimizations D2 & D10: Half-Width Output Write + Fused Physical Page Resolution in `qsa_localize_dcp_indices`)
 
-- **Why**: Allows `_forward_qsa_dcp` to pass `local_indices_buffer[:B, :local_width]` (`1026` columns instead of `2051`), cutting `-1` padding global-memory stores in half while remaining 100% compatible with callers that pass a full-width output buffer.
+- **Why**: Writes only `:local_width` (`1026` columns instead of `2051`) and optionally resolves physical KV cache page slots (`physical_page * PAGE_SIZE + page_offset`) directly inside `_localize_indices` (`RESOLVE_PHYSICAL=True`) so `_qsa_sparse_paged_gqa_splitk_kernel` skips per-tile `block_table` global memory indirection.
 - **Diff**:
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py
-index 050f072..35d3a44 100644
+index 050f072..b70e969 100644
 --- a/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py
 +++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py
-@@ -20,6 +20,7 @@ def _localize_indices(
+@@ -13,28 +13,64 @@ import torch
+ from vllm.triton_utils import tl, triton
+
+
+-@triton.jit
++@triton.jit(do_not_specialize=["num_cache_blocks", "num_requests"])
+ def _localize_indices(
+     src,
+     dst,
      src_stride,
      dst_stride,
++    block_table_ptr,
++    token_to_req_ptr,
++    table_stride_req,
++    num_cache_blocks,
++    num_requests,
      WIDTH: tl.constexpr,
 +    OUT_WIDTH: tl.constexpr,
      WORLD: tl.constexpr,
      RANK: tl.constexpr,
      INTERLEAVE: tl.constexpr,
-@@ -33,8 +34,12 @@ def _localize_indices(
+     BLOCK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr = 1,
++    PAGE_TABLE_WIDTH: tl.constexpr = 1,
++    RESOLVE_PHYSICAL: tl.constexpr = False,
+ ):
+     row = tl.program_id(0)
+     col = tl.arange(0, BLOCK)
+     token = tl.load(src + row * src_stride + col, col < WIDTH, other=-1)
+     owned = (col < WIDTH) & (token >= 0) & ((token // INTERLEAVE) % WORLD == RANK)
+     local = token // (WORLD * INTERLEAVE) * INTERLEAVE + token % INTERLEAVE
++    if RESOLVE_PHYSICAL:
++        request = tl.load(token_to_req_ptr + row)
++        safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
++        safe_local = tl.maximum(local, 0)
++        logical_page = safe_local // PAGE_SIZE
++        page_offset = safe_local % PAGE_SIZE
++        valid_page = (
++            owned
++            & (request >= 0)
++            & (request < num_requests)
++            & (logical_page < PAGE_TABLE_WIDTH)
++        )
++        physical_page = tl.load(
++            block_table_ptr
++            + safe_request * table_stride_req
++            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
++            mask=valid_page,
++            other=-1,
++        )
++        valid_phys = (
++            valid_page & (physical_page >= 0) & (physical_page < num_cache_blocks)
++        )
++        local = tl.where(valid_phys, physical_page * PAGE_SIZE + page_offset, -1)
      position = tl.cumsum(owned.to(tl.int32), 0) - 1
      count = tl.sum(owned.to(tl.int32), 0)
      # Disjoint writes avoid races between warp-local compaction and padding.
@@ -429,7 +492,17 @@ index 050f072..35d3a44 100644
 
 
  def qsa_dcp_local_selection_width(
-@@ -77,7 +82,14 @@ def qsa_localize_dcp_indices(
+@@ -69,6 +105,9 @@ def qsa_localize_dcp_indices(
+     dcp_rank: int,
+     interleave_size: int,
+     local_block_size: int,
++    block_table: torch.Tensor | None = None,
++    token_to_req: torch.Tensor | None = None,
++    num_cache_blocks: int | None = None,
+ ) -> torch.Tensor:
+     """Compact this rank's selected IDs into an independent persistent buffer.
+
+@@ -77,7 +116,14 @@ def qsa_localize_dcp_indices(
      Requiring interleave to divide a local page makes flat localization agree
      with block-table slot mapping at every global page boundary.
      """
@@ -445,7 +518,7 @@ index 050f072..35d3a44 100644
          raise ValueError("QSA DCP needs matching [rows, selection_width] buffers")
      if indices.dtype != torch.int32 or out.dtype != torch.int32:
          raise ValueError("QSA DCP indices must be int32")
-@@ -100,7 +112,7 @@ def qsa_localize_dcp_indices(
+@@ -100,19 +146,33 @@ def qsa_localize_dcp_indices(
      if indices.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
          raise ValueError("QSA DCP output must not alias the MTP selection buffer")
      if dcp_world_size == 1:
@@ -454,29 +527,674 @@ index 050f072..35d3a44 100644
          return out
      if not indices.is_cuda:
          raise ValueError("QSA DCP localization requires CUDA buffers")
-@@ -110,6 +122,7 @@ def qsa_localize_dcp_indices(
++    resolve_physical = (
++        block_table is not None
++        and token_to_req is not None
++        and num_cache_blocks is not None
++    )
+     _localize_indices[(indices.shape[0],)](
+         indices,
+         out,
          indices.stride(0),
          out.stride(0),
++        block_table,
++        token_to_req,
++        block_table.stride(0) if block_table is not None else 0,
++        num_cache_blocks if num_cache_blocks is not None else 0,
++        block_table.shape[0] if block_table is not None else 0,
          WIDTH=indices.shape[1],
 +        OUT_WIDTH=out.shape[1],
          WORLD=dcp_world_size,
          RANK=dcp_rank,
          INTERLEAVE=interleave_size,
+         BLOCK=triton.next_power_of_2(indices.shape[1]),
++        PAGE_SIZE=local_block_size,
++        PAGE_TABLE_WIDTH=block_table.shape[1] if block_table is not None else 1,
++        RESOLVE_PHYSICAL=resolve_physical,
+     )
+     return out
 ```
 
 ---
 
-### 8.3 `vllm/models/qwen4_exp/nvidia/qsa.py` (Optimizations 3.2, D1, D2, D4, D5)
+### 8.3 `vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py` (Optimization D7: Preallocated Output Buffers in `maybe_shared_key_scores`)
 
-- **Why**:
-  1. Vectorizes replicated MTP draft block-table expansion under `DCP2` (`Qwen4ExpQSAMetadataBuilder.build`).
-  2. Skips full-buffer `output.zero_()` when `qsa_dcp_sharded` is active and `num_tokens > 0`, zeroing only `output[num_tokens:]` when padded (`forward_qsa`).
-  3. Passes narrowed `local_indices_buffer[:B, :local_width]` to `qsa_localize_dcp_indices` and routes `dcp_a2a_lse_reduce` through the fused `out=output, output_gate=gate_view` kernel (`_forward_qsa_dcp`).
-  4. Avoids flattening the non-contiguous 3D `gate` slice (`q_gate[..., self.head_dim :]`) into a 2D tensor in `Qwen4ExpQSAAttention.forward`.
+- **Why**: Accepts optional `scores` and `visible` workspace views from `qsa_mqa_paged` / `qsa_select_paged_tokens` to avoid allocating `[B, columns]` FP32 and `[B]` INT32 tensors on every QSA layer.
+- **Diff**:
+```diff
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
+index 8b5f9b8..51e7a11 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
+@@ -59,14 +59,38 @@ def shared_key_reason(q, cache, table, requests, positions, lengths):
+
+
+ def maybe_shared_key_scores(
+-    q, cache, table, requests, positions, lengths, compress, columns, divisor
++    q,
++    cache,
++    table,
++    requests,
++    positions,
++    lengths,
++    compress,
++    columns,
++    divisor,
++    scores: torch.Tensor | None = None,
++    visible: torch.Tensor | None = None,
+ ):
+     reason = shared_key_reason(q, cache, table, requests, positions, lengths)
+     if reason is not None:
+         logger.info_once("SM70 QSA shared-key scorer fallback: %s.", reason)
+         return None
+-    scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+-    visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
++    if (
++        scores is None
++        or scores.shape != (q.shape[0], columns)
++        or scores.dtype != torch.float32
++        or scores.device != q.device
++        or not scores.is_contiguous()
++    ):
++        scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
++    if (
++        visible is None
++        or visible.shape != (q.shape[0],)
++        or visible.dtype != torch.int32
++        or visible.device != q.device
++        or not visible.is_contiguous()
++    ):
++        visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+     torch.ops.vllm_sm70_qsa_indexer.run(
+         scores,
+         visible,
+```
+
+---
+
+### 8.4 `vllm/models/qwen4_exp/nvidia/ops/qsa.py` (Optimizations 3.1, D3, D7, D9, D10 & D11: Prefill Visibility Cache, Split-K & Selector Workspaces, Live-Context `score_columns` Bounding, Empty-Tile Skip, and Two-Warp `G=12` Launch)
+
+- **Why**: Caches `(all_visible, max_visible)` across QSA layers in prefill; adds persistent 1D workspaces `_qsa_splitk_workspace` and `_qsa_selector_workspace`; bounds decode `score_columns` to active context length (`_qsa_bounded_decode_score_columns`); skips KV loads and Tensor Core MMAs on empty `-1` tiles (`if tl.max(logical_token, axis=0) >= 0:`); accepts `pre_resolved_indices`; and enables 2-warp SM70 partial kernel launches for `TP4 + DCP2` (`group_size == 12`).
+- **Diff**:
+```diff
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index aa5e6a6..9347a36 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -70,6 +70,14 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
+         torch.Tensor,
+     ],
+ ] = {}
++_SM70_QSA_SPLITK_WORKSPACES: dict[
++    tuple[int, int],
++    tuple[int, int, torch.Tensor, torch.Tensor],
++] = {}
++_SM70_QSA_SELECTOR_WORKSPACES: dict[
++    tuple[int, int],
++    tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor],
++] = {}
+ _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
+
+
+@@ -703,89 +711,92 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+             mask=columns < TOPK,
+             other=-1,
+         )
+-        safe_token = tl.maximum(logical_token, 0)
+-        logical_page = safe_token // PAGE_SIZE
+-        page_offset = safe_token % PAGE_SIZE
+-        valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+-        if DEVICE_HISTORY:
+-            valid &= (logical_token <= position) & (logical_token < length)
+-        if RESOLVED_INDICES:
+-            physical_page = logical_page
+-        else:
+-            valid &= logical_page < PAGE_TABLE_WIDTH
+-            physical_page = tl.load(
+-                block_table_ptr
+-                + safe_request * stride_table_req
+-                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+-                mask=valid,
+-                other=-1,
+-            )
+-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+-        # physical_page * block stride can overflow int32 for large caches.
+-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+-        if HOST_CACHE:
+-            hot_tokens = tl.load(
+-                HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
+-            )
+-            valid &= hot_tokens >= -1
+-        if HOST_CACHE:
+-            keys, values = load_host_kv(
+-                k_cache_ptr,
+-                v_cache_ptr,
+-                hot_tokens,
+-                row,
+-                columns,
+-                valid,
+-                dim_offsets,
+-                tl.cdiv(TOPK, 4) * 4,
+-                HEAD_DIM,
+-            )
+-        else:
+-            keys = tl.load(
+-                k_cache_ptr
+-                + safe_page[None, :] * stride_k_block
+-                + page_offset[None, :] * stride_k_token
+-                + kv_head * stride_k_head
+-                + dim_offsets[:, None],
+-                mask=valid[None, :],
+-                other=0.0,
+-            )
+-            values = tl.load(
+-                v_cache_ptr
+-                + safe_page[:, None] * stride_v_block
+-                + page_offset[:, None] * stride_v_token
+-                + kv_head * stride_v_head
+-                + dim_offsets[None, :],
+-                mask=valid[:, None],
+-                other=0.0,
++        if tl.max(logical_token, axis=0) >= 0:
++            safe_token = tl.maximum(logical_token, 0)
++            logical_page = safe_token // PAGE_SIZE
++            page_offset = safe_token % PAGE_SIZE
++            valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
++            if DEVICE_HISTORY:
++                valid &= (logical_token <= position) & (logical_token < length)
++            if RESOLVED_INDICES:
++                physical_page = logical_page
++            else:
++                valid &= logical_page < PAGE_TABLE_WIDTH
++                physical_page = tl.load(
++                    block_table_ptr
++                    + safe_request * stride_table_req
++                    + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
++                    mask=valid,
++                    other=-1,
++                )
++            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
++            # physical_page * block stride can overflow int32 for large caches.
++            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
++            if HOST_CACHE:
++                hot_tokens = tl.load(
++                    HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
++                )
++                valid &= hot_tokens >= -1
++            if HOST_CACHE:
++                keys, values = load_host_kv(
++                    k_cache_ptr,
++                    v_cache_ptr,
++                    hot_tokens,
++                    row,
++                    columns,
++                    valid,
++                    dim_offsets,
++                    tl.cdiv(TOPK, 4) * 4,
++                    HEAD_DIM,
++                )
++            else:
++                keys = tl.load(
++                    k_cache_ptr
++                    + safe_page[None, :] * stride_k_block
++                    + page_offset[None, :] * stride_k_token
++                    + kv_head * stride_k_head
++                    + dim_offsets[:, None],
++                    mask=valid[None, :],
++                    other=0.0,
++                )
++                values = tl.load(
++                    v_cache_ptr
++                    + safe_page[:, None] * stride_v_block
++                    + page_offset[:, None] * stride_v_token
++                    + kv_head * stride_v_head
++                    + dim_offsets[None, :],
++                    mask=valid[:, None],
++                    other=0.0,
++                )
++            if DEVICE_HISTORY and HISTORY_E4M3:
++                slot = safe_page * PAGE_SIZE + page_offset
++                key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
++                value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
++                keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
++                    query.dtype
++                )
++                values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
++                    query.dtype
++                )
++            if KV_E4M3:
++                keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
++                values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
++            scores = tl.dot(query, keys)
++            # Scaling scores avoids re-quantizing a scaled query to BF16.
++            scores *= qk_scale_log2
++            scores = tl.where(valid[None, :], scores, -1.0e20)
++            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
++            alpha = tl.math.exp2(max_value - next_max)
++            probabilities = tl.where(
++                valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+             )
+-        if DEVICE_HISTORY and HISTORY_E4M3:
+-            slot = safe_page * PAGE_SIZE + page_offset
+-            key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
+-            value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
+-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
+-            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+-                query.dtype
++            accumulator = tl.dot(
++                probabilities.to(values.dtype),
++                values,
++                acc=accumulator * alpha[:, None],
+             )
+-        if KV_E4M3:
+-            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
+-            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
+-        scores = tl.dot(query, keys)
+-        # Scaling scores avoids re-quantizing a scaled query to BF16.
+-        scores *= qk_scale_log2
+-        scores = tl.where(valid[None, :], scores, -1.0e20)
+-        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+-        alpha = tl.math.exp2(max_value - next_max)
+-        probabilities = tl.where(
+-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+-        )
+-        accumulator = tl.dot(
+-            probabilities.to(values.dtype),
+-            values,
+-            acc=accumulator * alpha[:, None],
+-        )
+-        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+-        max_value = next_max
++            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
++            max_value = next_max
+
+     has_values = normalizer > 0
+     normalized_output = tl.where(
+@@ -1174,6 +1185,8 @@ def qsa_mqa_paged(
+     num_columns: int | None = None,
+     score_scale: float | None = None,
+     shared_key_scoring: bool = False,
++    out_logits: torch.Tensor | None = None,
++    out_visible_blocks: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Compute QSA scores directly from a paged compressed-key cache."""
+
+@@ -1217,11 +1230,31 @@ def qsa_mqa_paged(
+             compress_ratio,
+             columns,
+             score_divisor,
++            scores=out_logits,
++            visible=out_visible_blocks,
+         )
+         if result is not None:
+             return result
+-    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+-    visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
++    if (
++        out_logits is not None
++        and out_logits.shape == (q.shape[0], columns)
++        and out_logits.dtype == torch.float32
++        and out_logits.device == q.device
++        and out_logits.is_contiguous()
++    ):
++        logits = out_logits
++    else:
++        logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
++    if (
++        out_visible_blocks is not None
++        and out_visible_blocks.shape == (q.shape[0],)
++        and out_visible_blocks.dtype == torch.int32
++        and out_visible_blocks.device == q.device
++        and out_visible_blocks.is_contiguous()
++    ):
++        visible_blocks = out_visible_blocks
++    else:
++        visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+     if not q.shape[0] or not columns:
+         return logits, visible_blocks
+     sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
+@@ -1523,6 +1556,8 @@ def _qsa_select_by_request(
+     compress_ratio: int,
+     out: torch.Tensor,
+     query_start_loc_cpu: torch.Tensor,
++    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]]
++    | None = None,
+ ) -> bool:
+     """Select a multi-request batch one long request at a time.
+
+@@ -1565,6 +1600,8 @@ def _qsa_select_by_request(
+                 token_topk,
+                 compress_ratio,
+                 out[start:end],
++                visible_blocks_cache=visible_blocks_cache,
++                _cache_row_range=(start, end),
+             )
+         else:
+             qsa_select_paged_tokens(
+@@ -1577,10 +1614,93 @@ def _qsa_select_by_request(
+                 token_topk,
+                 compress_ratio,
+                 out[start:end],
++                visible_blocks_cache=visible_blocks_cache,
++                _cache_row_range=(start, end),
+             )
+     return True
+
+
++def _qsa_bounded_decode_score_columns(
++    q: torch.Tensor,
++    capacity_columns: int,
++    block_topk: int,
++    compress_ratio: int,
++    max_seq_len: int | None,
++) -> int:
++    if capacity_columns <= 0 or compress_ratio <= 0:
++        return capacity_columns
++    from vllm.config.compilation import CUDAGraphMode
++    from vllm.forward_context import (
++        get_forward_context,
++        is_forward_context_available,
++    )
++
++    capturing = bool(q.is_cuda and torch.cuda.is_current_stream_capturing())
++    bound_seq_len: int | None = None
++    if is_forward_context_available():
++        context = get_forward_context()
++        descriptor = context.batch_descriptor
++        bucket = getattr(descriptor, "attention_context_bucket", None)
++        if capturing or context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
++            bound_seq_len = bucket
++        else:
++            bound_seq_len = max_seq_len if max_seq_len is not None else bucket
++    elif not capturing:
++        bound_seq_len = max_seq_len
++    if bound_seq_len is None or bound_seq_len <= 0:
++        return capacity_columns
++    live_columns = ((bound_seq_len // compress_ratio + 63) // 64) * 64
++    return min(capacity_columns, max(block_topk, live_columns))
++
++
++def _qsa_selector_workspace(
++    q: torch.Tensor,
++    chunk_rows: int,
++    score_columns: int,
++    block_topk: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    device_index = q.device.index if q.device.index is not None else -1
++    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
++    key = (device_index, stream_id)
++    cache = workspace_cache("qsa_selector", _SM70_QSA_SELECTOR_WORKSPACES)
++    workspace = cache.get(key)
++    needed_logits = max(chunk_rows * score_columns, 1)
++    needed_visible = max(chunk_rows, 1)
++    needed_blocks = max(chunk_rows * block_topk, 1)
++    if (
++        workspace is None
++        or workspace[0] < needed_logits
++        or workspace[1] < needed_visible
++        or workspace[2] < needed_blocks
++    ):
++        logits_cap = 1 << (needed_logits - 1).bit_length()
++        visible_cap = 1 << (needed_visible - 1).bit_length()
++        blocks_cap = 1 << (needed_blocks - 1).bit_length()
++        if workspace is not None:
++            logits_cap = max(logits_cap, workspace[0])
++            visible_cap = max(visible_cap, workspace[1])
++            blocks_cap = max(blocks_cap, workspace[2])
++        logits_buf = torch.empty((logits_cap,), dtype=torch.float32, device=q.device)
++        visible_buf = torch.empty((visible_cap,), dtype=torch.int32, device=q.device)
++        blocks_buf = torch.empty((blocks_cap,), dtype=torch.int32, device=q.device)
++        workspace = (
++            logits_cap,
++            visible_cap,
++            blocks_cap,
++            logits_buf,
++            visible_buf,
++            blocks_buf,
++        )
++        cache[key] = workspace
++    retain_for_capture(cache, workspace, q)
++    _, _, _, logits_buf, visible_buf, blocks_buf = workspace
++    return (
++        logits_buf,
++        visible_buf,
++        blocks_buf[: chunk_rows * block_topk].view(chunk_rows, block_topk),
++    )
++
++
+ def qsa_select_paged_tokens(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -1593,6 +1713,10 @@ def qsa_select_paged_tokens(
+     out: torch.Tensor | None = None,
+     query_start_loc_cpu: torch.Tensor | None = None,
+     shared_key_scoring: bool = False,
++    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]]
++    | None = None,
++    _cache_row_range: tuple[int, int] | None = None,
++    max_seq_len: int | None = None,
+ ) -> torch.Tensor:
+     """Score, select, and expand QSA indices without host synchronization."""
+
+@@ -1615,6 +1739,7 @@ def qsa_select_paged_tokens(
+         compress_ratio,
+         out,
+         query_start_loc_cpu,
++        visible_blocks_cache=visible_blocks_cache,
+     ):
+         return out
+
+@@ -1625,19 +1750,34 @@ def qsa_select_paged_tokens(
+     key_valid: torch.Tensor | None = None
+     all_visible: torch.Tensor | None = None
+     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+-        all_visible = _qsa_visible_blocks(
+-            token_to_req,
+-            query_positions,
+-            sequence_lengths,
+-            compress_ratio,
++        start_row, end_row = (
++            _cache_row_range if _cache_row_range is not None else (0, rows)
++        )
++        cache_key = (start_row, end_row, int(compress_ratio))
++        cached_visible = (
++            visible_blocks_cache.get(cache_key)
++            if visible_blocks_cache is not None
++            else None
+         )
++        if cached_visible is None:
++            all_visible = _qsa_visible_blocks(
++                token_to_req,
++                query_positions,
++                sequence_lengths,
++                compress_ratio,
++            )
++            max_visible = int(all_visible.max().item())
++            if visible_blocks_cache is not None:
++                visible_blocks_cache[cache_key] = (all_visible, max_visible)
++        else:
++            all_visible, max_visible = cached_visible
+         # cuBLAS has a rectangular host-side launch shape, unlike the paged
+         # Triton kernel's device-side early exit. Bound it to this chunk's live
+         # prefix so early-context prefill does not multiply the unused 140K
+-        # model-capacity tail. This is one scalar sync per QSA layer.
++        # model-capacity tail. Cached across QSA layers in the same forward pass.
+         score_columns = min(
+             capacity_columns,
+-            max(block_topk, int(all_visible.max().item())),
++            max(block_topk, max_visible),
+         )
+         if _qsa_indexer_cublas_work_supported(rows, score_columns):
+             logger.info_once(
+@@ -1653,13 +1793,26 @@ def qsa_select_paged_tokens(
+                 k_cache, page_table, score_columns
+             )
+         else:
+-            score_columns = capacity_columns
++            score_columns = _qsa_bounded_decode_score_columns(
++                q, capacity_columns, block_topk, compress_ratio, max_seq_len
++            )
+             all_visible = None
++    else:
++        score_columns = _qsa_bounded_decode_score_columns(
++            q, capacity_columns, block_topk, compress_ratio, max_seq_len
++        )
+     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
+     chunk_rows = min(rows, rows_per_chunk)
+-    blocks_buffer = torch.empty(
+-        (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+-    )
++    if q.is_cuda:
++        logits_buf, visible_buf, blocks_buffer = _qsa_selector_workspace(
++            q, chunk_rows, score_columns, block_topk
++        )
++    else:
++        logits_buf = None
++        visible_buf = None
++        blocks_buffer = torch.empty(
++            (chunk_rows, block_topk), dtype=torch.int32, device=q.device
++        )
+     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
+     topk_workspace = (
+         None
+@@ -1669,6 +1822,7 @@ def qsa_select_paged_tokens(
+     for row_start in range(0, rows, rows_per_chunk):
+         row_end = min(row_start + rows_per_chunk, rows)
+         row_slice = slice(row_start, row_end)
++        chunk_n = row_end - row_start
+         if contiguous_keys is not None and key_valid is not None:
+             assert all_visible is not None
+             logits, visible_blocks = _qsa_mqa_cublas(
+@@ -1678,6 +1832,16 @@ def qsa_select_paged_tokens(
+                 all_visible[row_slice],
+             )
+         else:
++            paged_kwargs: dict[str, object] = {
++                "shared_key_scoring": shared_key_scoring,
++            }
++            if score_columns != capacity_columns:
++                paged_kwargs["num_columns"] = score_columns
++            if logits_buf is not None and visible_buf is not None:
++                paged_kwargs["out_logits"] = logits_buf[
++                    : chunk_n * score_columns
++                ].view(chunk_n, score_columns)
++                paged_kwargs["out_visible_blocks"] = visible_buf[:chunk_n]
+             logits, visible_blocks = qsa_mqa_paged(
+                 q[row_slice],
+                 k_cache,
+@@ -1686,9 +1850,9 @@ def qsa_select_paged_tokens(
+                 query_positions[row_slice],
+                 sequence_lengths,
+                 compress_ratio,
+-                shared_key_scoring=shared_key_scoring,
++                **paged_kwargs,  # type: ignore[arg-type]
+             )
+-        blocks = blocks_buffer[: row_end - row_start]
++        blocks = blocks_buffer[:chunk_n]
+         use_cooperative_topk = (
+             blocks.shape[0] <= 32
+             and logits.stride(0) % 4 == 0
+@@ -1976,6 +2140,40 @@ def _qsa_grouped_page4_workspace(
+     )
+
+
++def _qsa_splitk_workspace(
++    q: torch.Tensor,
++    num_splits: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    device_index = q.device.index if q.device.index is not None else -1
++    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
++    key = (device_index, stream_id)
++    cache = workspace_cache("qsa_splitk", _SM70_QSA_SPLITK_WORKSPACES)
++    workspace = cache.get(key)
++    rows, heads, head_dim = q.shape
++    needed_lse = num_splits * rows * heads
++    needed_out = needed_lse * head_dim
++    if workspace is None or workspace[0] < needed_out or workspace[1] < needed_lse:
++        out_capacity = 1 << (max(needed_out, 1) - 1).bit_length()
++        lse_capacity = 1 << (max(needed_lse, 1) - 1).bit_length()
++        if workspace is not None:
++            out_capacity = max(out_capacity, workspace[0])
++            lse_capacity = max(lse_capacity, workspace[1])
++        partial_output_buf = torch.empty(
++            (out_capacity,), dtype=torch.float32, device=q.device
++        )
++        partial_lse_buf = torch.empty(
++            (lse_capacity,), dtype=torch.float32, device=q.device
++        )
++        workspace = (out_capacity, lse_capacity, partial_output_buf, partial_lse_buf)
++        cache[key] = workspace
++    retain_for_capture(cache, workspace, q)
++    _, _, partial_output_buf, partial_lse_buf = workspace
++    return (
++        partial_output_buf[:needed_out].view(num_splits, rows, heads, head_dim),
++        partial_lse_buf[:needed_lse].view(num_splits, rows, heads),
++    )
++
++
+ def _qsa_xqa_page4_physical_kv(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -2349,6 +2547,7 @@ def qsa_sparse_paged_attention(
+     k_scale: float = 1.0,
+     v_scale: float = 1.0,
+     lse: torch.Tensor | None = None,
++    pre_resolved_indices: bool = False,
+ ) -> torch.Tensor:
+     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
+
+@@ -2453,10 +2652,10 @@ def qsa_sparse_paged_attention(
+                 _qsa_output_gate(xqa_output, output_gate_view)
+             return xqa_output
+
+-    resolved_indices = _use_sm70_qsa_resolved_indices(
++    resolved_indices = pre_resolved_indices or _use_sm70_qsa_resolved_indices(
+         q, k_cache, logical_indices, kv_cache_dtype
+     )
+-    if resolved_indices:
++    if resolved_indices and not pre_resolved_indices:
+         physical_indices = torch.empty_like(logical_indices)
+         _qsa_resolve_physical_indices_kernel[(1, triton.cdiv(2051, 256))](
+             logical_indices,
+@@ -2500,15 +2699,9 @@ def qsa_sparse_paged_attention(
+         partial_lse = out
+     else:
+         # FP32 partials preserve accuracy when merging independently normalized
+-        # splits.
+-        partial_output = torch.empty(
+-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
+-        )
+-        partial_lse = torch.empty(
+-            (num_splits, q.shape[0], q.shape[1]),
+-            dtype=torch.float32,
+-            device=q.device,
+-        )
++        # splits. Reuse per-stream scratch buffers to avoid 24 dynamic tensor
++        # allocations per step across the 12 target QSA layers on TP4+DCP2.
++        partial_output, partial_lse = _qsa_splitk_workspace(q, num_splits)
+
+     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+@@ -2624,7 +2817,7 @@ def _use_sm70_qsa_two_warp_partial(
+     """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
+     return bool(
+         0 < num_query_tokens <= 16
+-        and group_size == 6
++        and group_size in (6, 12)
+         and head_dim == 256
+         and current_platform.is_device_capability(70)
+     )
+```
+
+---
+
+### 8.5 `vllm/models/qwen4_exp/nvidia/qsa.py` (Optimizations 3.2, D1, D2, D4, D5, D7, D8 & D10: 3D Gate Passthrough, Fused DCP Combine, Persistent DCP AllGather & Prep Buffers, Fused Physical Index Resolution, and Vectorized Draft Block-Table Expansion)
+
+- **Why**: Passes 3D strided `output_gate` views without contiguous copies; fuses DCP LSE combine + FP16 round + gate; reuses persistent `_dcp_ag_recv_buffer` / `_dcp_ag_out_buffer` in `_all_gather_dcp_query` and `_prepared_q_buffer` / cached `kv_cache.unbind(1)` in `_run_qsa`; passes `block_table` into `qsa_localize_dcp_indices` for fused physical resolution; skips redundant `output.zero_()` on `qsa_dcp_sharded`; and vectorizes replicated-draft block-table expansion.
 - **Diff**:
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
-index 7826024..5472099 100644
+index 7826024..d668aa9 100644
 --- a/vllm/models/qwen4_exp/nvidia/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/qsa.py
 @@ -153,10 +153,20 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -523,7 +1241,89 @@ index 7826024..5472099 100644
          else:
              output.zero_()
          if num_tokens == 0:
-@@ -386,6 +400,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -300,9 +314,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             return output
+         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
+         # [num_blocks, 2, block_size, num_kv_heads, head_size].
+-        key_cache, value_cache = kv_cache.unbind(1)
+-        key_cache = canonicalize_singleton_dim_strides(key_cache)
+-        value_cache = canonicalize_singleton_dim_strides(value_cache)
++        kv_cache_key = (kv_cache.data_ptr(), kv_cache.shape, kv_cache.stride())
++        if getattr(self, "_cached_kv_unbind_key", None) == kv_cache_key:
++            key_cache, value_cache = self._cached_kv_unbind_pair
++        else:
++            key_cache, value_cache = kv_cache.unbind(1)
++            key_cache = canonicalize_singleton_dim_strides(key_cache)
++            value_cache = canonicalize_singleton_dim_strides(value_cache)
++            self._cached_kv_unbind_key = kv_cache_key
++            self._cached_kv_unbind_pair = (key_cache, value_cache)
+         if query.dtype not in (torch.float16, torch.bfloat16):
+             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
+         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+@@ -373,6 +393,62 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         )
+         return output
+
++    def _all_gather_dcp_query(
++        self,
++        query: torch.Tensor,
++        group: Any,
++    ) -> torch.Tensor:
++        q_contig = query if query.is_contiguous() else query.contiguous()
++        device_group = getattr(group, "device_group", None)
++        if device_group is None and hasattr(group, "device_communicator"):
++            device_group = getattr(group.device_communicator, "device_group", None)
++        if device_group is None:
++            return group.all_gather(q_contig, dim=1)
++        rows, heads, dim = q_contig.shape
++        world_size = self.dcp_world_size
++        needed = world_size * rows * heads * dim
++        recv_buf = getattr(self, "_dcp_ag_recv_buffer", None)
++        if (
++            recv_buf is None
++            or recv_buf.numel() < needed
++            or recv_buf.dtype != q_contig.dtype
++            or recv_buf.device != q_contig.device
++        ):
++            cap = 1 << (max(needed, 1) - 1).bit_length()
++            if (
++                recv_buf is not None
++                and recv_buf.device == q_contig.device
++                and recv_buf.dtype == q_contig.dtype
++            ):
++                cap = max(cap, recv_buf.numel())
++            recv_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
++            self._dcp_ag_recv_buffer = recv_buf
++        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
++        torch.distributed.all_gather_into_tensor(
++            recv_view, q_contig, group=device_group
++        )
++        if rows == 1:
++            return recv_view.view(1, world_size * heads, dim)
++        out_buf = getattr(self, "_dcp_ag_out_buffer", None)
++        if (
++            out_buf is None
++            or out_buf.numel() < needed
++            or out_buf.dtype != q_contig.dtype
++            or out_buf.device != q_contig.device
++        ):
++            cap = 1 << (max(needed, 1) - 1).bit_length()
++            if (
++                out_buf is not None
++                and out_buf.device == q_contig.device
++                and out_buf.dtype == q_contig.dtype
++            ):
++                cap = max(cap, out_buf.numel())
++            out_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
++            self._dcp_ag_out_buffer = out_buf
++        out_view = out_buf[:needed].view(rows, world_size, heads, dim)
++        out_view.copy_(recv_view.view(world_size, rows, heads, dim).movedim(0, 1))
++        return out_view.view(rows, world_size * heads, dim)
++
+     def _forward_qsa_dcp(
+         self,
+         layer: torch.nn.Module,
+@@ -386,6 +462,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          output_gate: torch.Tensor,
      ) -> None:
          from vllm.distributed import get_dcp_group
@@ -531,7 +1331,7 @@ index 7826024..5472099 100644
 
          from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
          from .ops.qsa_dcp import (
-@@ -405,9 +420,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -405,33 +482,37 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              )
          ):
              raise RuntimeError("QSA DCP target workspaces are not initialized")
@@ -543,6 +1343,7 @@ index 7826024..5472099 100644
 +            layer.cp_kv_cache_interleave_size,
 +            logical_indices.shape[1],
 +        )
++        resolve_physical = bool(key_cache.shape[0] * key_cache.shape[1] < 2**31)
          local_indices = qsa_localize_dcp_indices(
              logical_indices,
 -            local_indices_buffer[: query.shape[0]],
@@ -550,7 +1351,15 @@ index 7826024..5472099 100644
              dcp_world_size=self.dcp_world_size,
              dcp_rank=self.dcp_rank,
              interleave_size=layer.cp_kv_cache_interleave_size,
-@@ -419,19 +442,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             local_block_size=key_cache.shape[1],
++            block_table=block_table if resolve_physical else None,
++            token_to_req=token_to_req if resolve_physical else None,
++            num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
+         )
+         group = get_dcp_group()
+-        gathered_query = group.all_gather(query.contiguous(), dim=1)
++        gathered_query = self._all_gather_dcp_query(query, group)
+         partial_output = partial_output_buffer[: query.shape[0]]
          partial_lse = partial_lse_buffer[: query.shape[0]]
          if partial_output.shape != gathered_query.shape:
              raise RuntimeError("QSA DCP partial output has wrong head geometry")
@@ -571,9 +1380,11 @@ index 7826024..5472099 100644
              block_table,
              token_to_req,
              partial_output,
-@@ -440,6 +455,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -439,7 +520,19 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             k_scale=layer._k_scale_float,
              v_scale=layer._v_scale_float,
              lse=partial_lse,
++            pre_resolved_indices=resolve_physical,
          )
 +        gate_view = output_gate.view_as(output)
 +        if self.dcp_combine is dcp_a2a_lse_reduce:
@@ -589,7 +1400,7 @@ index 7826024..5472099 100644
          merged = cast(
              torch.Tensor,
              self.dcp_combine(
-@@ -453,7 +479,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -453,7 +546,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          # apply the Triton gate DCP1's page4 route uses. This replaces a chain
          # of five elementwise kernels (12.2 us per decode layer on V100).
          output.copy_(merged)
@@ -598,7 +1409,7 @@ index 7826024..5472099 100644
 
 
  def _verify_e4m3_kv_requirements(
-@@ -862,6 +888,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -862,6 +955,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          self,
          qkv: torch.Tensor,
          positions: torch.Tensor,
@@ -607,7 +1418,7 @@ index 7826024..5472099 100644
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
          """Split, normalize, and rotate Q/K using this tree's Qwen3 API."""
          q_gate, key, value = qkv.split(
-@@ -875,7 +903,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -875,7 +970,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              key.view(*token_shape, self.num_kv_heads, self.head_dim)
          ).reshape(*token_shape, self.kv_size)
          query, key = self.rotary_emb(positions, query, key)
@@ -618,11 +1429,73 @@ index 7826024..5472099 100644
 
      def _use_dense_short_context(
          self, num_tokens: int, side_metadata: QSAForwardMetadata
-@@ -1043,12 +1073,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -978,12 +1075,48 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             self.host_kv.write(key, value, main_metadata.slot_mapping)
+         elif query.dim() == 2:
+             # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
+-            key_cache, value_cache = self.kv_cache.unbind(1)
+-            prepared = query.new_empty((num_tokens, self.num_heads, self.head_dim))
+-            text_positions = positions[0] if positions.dim() == 2 else positions
++            kv_cache_key = (
++                self.kv_cache.data_ptr(),
++                self.kv_cache.shape,
++                self.kv_cache.stride(),
++            )
++            if getattr(self, "_cached_raw_kv_unbind_key", None) == kv_cache_key:
++                key_cache, value_cache = self._cached_raw_kv_unbind_pair
++            else:
++                key_cache, value_cache = self.kv_cache.unbind(1)
++                self._cached_raw_kv_unbind_key = kv_cache_key
++                self._cached_raw_kv_unbind_pair = (key_cache, value_cache)
++            needed_q = num_tokens * self.num_heads * self.head_dim
++            prep_buf = getattr(self, "_prepared_q_buffer", None)
++            if (
++                prep_buf is None
++                or prep_buf.numel() < needed_q
++                or prep_buf.dtype != query.dtype
++                or prep_buf.device != query.device
++            ):
++                cap = 1 << (max(needed_q, 1) - 1).bit_length()
++                if (
++                    prep_buf is not None
++                    and prep_buf.device == query.device
++                    and prep_buf.dtype == query.dtype
++                ):
++                    cap = max(cap, prep_buf.numel())
++                prep_buf = torch.empty((cap,), dtype=query.dtype, device=query.device)
++                self._prepared_q_buffer = prep_buf
++            prepared = prep_buf[:needed_q].view(
++                num_tokens, self.num_heads, self.head_dim
++            )
++            text_positions = (positions[0] if positions.dim() == 2 else positions)[
++                :num_tokens
++            ]
++            if text_positions.dtype != torch.int64:
++                text_positions = text_positions.to(torch.int64)
++            slot_mapping = main_metadata.slot_mapping[:num_tokens]
++            if slot_mapping.dtype != torch.int64:
++                slot_mapping = slot_mapping.to(torch.int64)
+             torch.ops._C.qsa_prep_sm70_out(
+                 query[:num_tokens],
+-                text_positions[:num_tokens].to(torch.int64),
++                text_positions,
+                 self.rotary_emb.cos_sin_cache,
+                 self.q_norm.weight,
+                 self.k_norm.weight,
+@@ -991,7 +1124,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+                 prepared,
+                 key_cache,
+                 value_cache,
+-                main_metadata.slot_mapping[:num_tokens].to(torch.int64),
++                slot_mapping,
+             )
+             query = key = value = prepared
+         else:
+@@ -1043,12 +1176,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              q_gate = qkv[:, : self.q_size * 2].view(
                  num_tokens, self.num_heads, 2 * self.head_dim
              )
--            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.head_dim)
+-            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
 +            gate = q_gate[..., self.head_dim :]
              query = qkv
              key = value = qkv
@@ -639,15 +1512,13 @@ index 7826024..5472099 100644
 
 ---
 
-### 8.4 `vllm/models/qwen4_exp/nvidia/ops/qsa.py`, `vllm/models/qwen4_exp/common/qsa_cache.py`, & `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` (Optimizations 3.1 & D3)
+### 8.6 `vllm/models/qwen4_exp/common/qsa_cache.py` (Optimizations 3.1 & D9: Shared `visible_blocks_cache` and Live `max_seq_len` Upper Bound on `QSAForwardMetadata`)
 
-- **Why**:
-  1. Caches `(all_visible, max_visible)` on `QSAForwardMetadata.visible_blocks_cache` across all 12 QSA layers in a prefill chunk, eliminating 11/12 host-device `.item()` stalls and `_qsa_visible_blocks_kernel` launches.
-  2. Adds `_qsa_splitk_workspace(q, num_splits)` backed by `workspace_cache("qsa_splitk", _SM70_QSA_SPLITK_WORKSPACES)` and `retain_for_capture`, eliminating 24 dynamic GPU tensor allocations (`partial_output` + `partial_lse`) per decode step under `TP4 + DCP2`.
+- **Why**: Adds `visible_blocks_cache` and `max_seq_len` (tightened from `seq_lens_cpu_upper_bound` on non-dummy batches) to `QSAForwardMetadata`.
 - **Diff**:
 ```diff
 diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
-index f087d0b..48e2d7b 100644
+index f087d0b..b33e090 100644
 --- a/vllm/models/qwen4_exp/common/qsa_cache.py
 +++ b/vllm/models/qwen4_exp/common/qsa_cache.py
 @@ -14,7 +14,7 @@ shared by the generic cache-layout planner.
@@ -659,140 +1530,117 @@ index f087d0b..48e2d7b 100644
  from functools import cache
  from typing import ClassVar
 
-@@ -606,6 +606,9 @@ class QSAForwardMetadata(AttentionMetadata):
+@@ -606,6 +606,10 @@ class QSAForwardMetadata(AttentionMetadata):
      # Host copy of query_start_loc. It lets QSA selection split a mixed batch
      # by request without a device synchronization.
      query_start_loc_cpu: torch.Tensor | None = None
++    max_seq_len: int | None = None
 +    visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]] = field(
 +        default_factory=dict
 +    )
 
-diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-index 0369fac..2010871 100644
---- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-+++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-@@ -361,6 +361,7 @@ class QSAIndexer(nn.Module):
-             out,
-             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
-             shared_key_scoring=self.shared_key_scoring,
-+            visible_blocks_cache=compressed_metadata.visible_blocks_cache,
-         )
 
-diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-index aa5e6a6..2b452c9 100644
---- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-+++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-@@ -70,6 +70,10 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
-         torch.Tensor,
-     ],
- ] = {}
-+_SM70_QSA_SPLITK_WORKSPACES: dict[
-+    tuple[int, int],
-+    tuple[int, int, torch.Tensor, torch.Tensor],
-+] = {}
- _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
-...
-@@ -1625,19 +1639,34 @@ def qsa_select_paged_tokens(
-     key_valid: torch.Tensor | None = None
-     all_visible: torch.Tensor | None = None
-     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
--        all_visible = _qsa_visible_blocks(
--            token_to_req,
--            query_positions,
--            sequence_lengths,
--            compress_ratio,
-+        start_row, end_row = (
-+            _cache_row_range if _cache_row_range is not None else (0, rows)
+ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+@@ -624,6 +628,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+         block_table_width: int,
+     ) -> None:
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        self.max_model_len = vllm_config.model_config.max_model_len
+         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
+         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+         self.has_sharded_main_owner = any(
+@@ -788,6 +793,16 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+             self.is_circular_buffer or self.compress_ratio != 1
+         ):
+             slot_mapping.fill_(PAD_SLOT_ID)
++        max_seq_len = common_attn_metadata.max_seq_len
++        if (
++            not common_attn_metadata.is_dummy_batch
++            and max_seq_len >= self.max_model_len
++            and common_attn_metadata.seq_lens_cpu_upper_bound is not None
++            and common_attn_metadata.seq_lens_cpu_upper_bound.numel() > 0
++        ):
++            upper_bound = int(common_attn_metadata.seq_lens_cpu_upper_bound.max().item())
++            if upper_bound > 0:
++                max_seq_len = min(max_seq_len, upper_bound)
+         return QSAForwardMetadata(
+             block_table=block_table,
+             slot_mapping=slot_mapping,
+@@ -800,6 +815,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+             storage_block_size=self.storage_block_size,
+             compress_ratio=self.compress_ratio,
+             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
++            max_seq_len=max_seq_len,
          )
-+        cache_key = (start_row, end_row, int(compress_ratio))
-+        cached_visible = (
-+            visible_blocks_cache.get(cache_key)
-+            if visible_blocks_cache is not None
-+            else None
-+        )
-+        if cached_visible is None:
-+            all_visible = _qsa_visible_blocks(
-+                token_to_req,
-+                query_positions,
-+                sequence_lengths,
-+                compress_ratio,
-+            )
-+            max_visible = int(all_visible.max().item())
-+            if visible_blocks_cache is not None:
-+                visible_blocks_cache[cache_key] = (all_visible, max_visible)
-+        else:
-+            all_visible, max_visible = cached_visible
-         # cuBLAS has a rectangular host-side launch shape, unlike the paged
-         # Triton kernel's device-side early exit. Bound it to this chunk's live
-         # prefix so early-context prefill does not multiply the unused 140K
--        # model-capacity tail. This is one scalar sync per QSA layer.
-+        # model-capacity tail. Cached across QSA layers in the same forward pass.
-         score_columns = min(
-             capacity_columns,
--            max(block_topk, int(all_visible.max().item())),
-+            max(block_topk, max_visible),
-         )
-...
-@@ -1976,6 +2005,40 @@ def _qsa_grouped_page4_workspace(
-     )
-
-
-+def _qsa_splitk_workspace(
-+    q: torch.Tensor,
-+    num_splits: int,
-+) -> tuple[torch.Tensor, torch.Tensor]:
-+    device_index = q.device.index if q.device.index is not None else -1
-+    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
-+    key = (device_index, stream_id)
-+    cache = workspace_cache("qsa_splitk", _SM70_QSA_SPLITK_WORKSPACES)
-+    workspace = cache.get(key)
-+    rows, heads, head_dim = q.shape
-+    needed_lse = num_splits * rows * heads
-+    needed_out = needed_lse * head_dim
-+    if workspace is None or workspace[0] < needed_out or workspace[1] < needed_lse:
-+        out_capacity = 1 << (max(needed_out, 1) - 1).bit_length()
-+        lse_capacity = 1 << (max(needed_lse, 1) - 1).bit_length()
-+        if workspace is not None:
-+            out_capacity = max(out_capacity, workspace[0])
-+            lse_capacity = max(lse_capacity, workspace[1])
-+        partial_output_buf = torch.empty(
-+            (out_capacity,), dtype=torch.float32, device=q.device
-+        )
-+        partial_lse_buf = torch.empty(
-+            (lse_capacity,), dtype=torch.float32, device=q.device
-+        )
-+        workspace = (out_capacity, lse_capacity, partial_output_buf, partial_lse_buf)
-+        cache[key] = workspace
-+    retain_for_capture(cache, workspace, q)
-+    _, _, partial_output_buf, partial_lse_buf = workspace
-+    return (
-+        partial_output_buf[:needed_out].view(num_splits, rows, heads, head_dim),
-+        partial_lse_buf[:needed_lse].view(num_splits, rows, heads),
-+    )
-...
-@@ -2500,15 +2563,9 @@ def qsa_sparse_paged_attention(
-         partial_lse = out
-     else:
-         # FP32 partials preserve accuracy when merging independently normalized
--        # splits.
--        partial_output = torch.empty(
--            (num_splits, *q.shape), dtype=torch.float32, device=q.device
--        )
--        partial_lse = torch.empty(
--            (num_splits, q.shape[0], q.shape[1]),
--            dtype=torch.float32,
--            device=q.device,
--        )
-+        # splits. Reuse per-stream scratch buffers to avoid 24 dynamic tensor
-+        # allocations per step across the 12 target QSA layers on TP4+DCP2.
-+        partial_output, partial_lse = _qsa_splitk_workspace(q, num_splits)
 ```
 
 ---
 
-### 8.5 `vllm/v1/attention/backends/gdn_attn.py` (Optimization D6: Lazy `compute_num_computed_tokens()` on Decode)
+### 8.7 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` (Optimizations 3.1, D7 & D9: Persistent Indexer Query Buffer and `max_seq_len` Passthrough in `QSAIndexer.forward`)
 
-- **Why**: Under `TP4 + DCP2`, the 36 GDN layers are partitioned into **6 GDN KV-cache groups**. Moving `context_lens_tensor = m.compute_num_computed_tokens()` inside `if num_prefills > 0:` eliminates **12 wasted GPU elementwise kernel launches and 12 tensor allocations per decode step**.
+- **Why**: Reuses a persistent 1D `_q_buffer` instead of allocating `projected_q.new_empty(num_tokens, 4, 128)` per layer, and forwards `visible_blocks_cache` and `max_seq_len` into `qsa_select_paged_tokens`.
+- **Diff**:
+```diff
+diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+index 0369fac..d894ed6 100644
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -166,6 +166,28 @@ class QSAIndexer(nn.Module):
+             cache_config=cache_config,
+             vllm_config=vllm_config,
+         )
++        self._q_buffer: torch.Tensor | None = None
++
++    def _get_q_buffer(
++        self,
++        num_tokens: int,
++        dtype: torch.dtype,
++        device: torch.device,
++    ) -> torch.Tensor:
++        needed = num_tokens * self.index_n_heads * self.index_head_dim
++        buf = self._q_buffer
++        if (
++            buf is None
++            or buf.numel() < needed
++            or buf.dtype != dtype
++            or buf.device != device
++        ):
++            cap = 1 << (max(needed, 1) - 1).bit_length()
++            if buf is not None and buf.device == device and buf.dtype == dtype:
++                cap = max(cap, buf.numel())
++            buf = torch.empty((cap,), dtype=dtype, device=device)
++            self._q_buffer = buf
++        return buf[:needed].view(num_tokens, self.index_n_heads, self.index_head_dim)
+
+     @property
+     def output_width(self) -> int:
+@@ -248,11 +270,7 @@ class QSAIndexer(nn.Module):
+         compressed_key_cache = self.compressed_key_cache.kv_cache
+
+         if self.use_fused_pre_indexer:
+-            q = projected_q.new_empty(
+-                num_tokens,
+-                self.index_n_heads,
+-                self.index_head_dim,
+-            )
++            q = self._get_q_buffer(num_tokens, projected_q.dtype, projected_q.device)
+             qsa_pre_indexer(
+                 projected_q,
+                 raw_keys,
+@@ -361,6 +379,8 @@ class QSAIndexer(nn.Module):
+             out,
+             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
+             shared_key_scoring=self.shared_key_scoring,
++            visible_blocks_cache=compressed_metadata.visible_blocks_cache,
++            max_seq_len=compressed_metadata.max_seq_len,
+         )
+```
+
+---
+
+### 8.8 `vllm/v1/attention/backends/gdn_attn.py` (Optimization D6: Lazy `compute_num_computed_tokens()` on Decode in `GDNAttentionMetadataBuilder.build`)
+
+- **Why**: Moves `context_lens_tensor = m.compute_num_computed_tokens()` inside `if num_prefills > 0:`, saving 12 GPU kernel launches and 12 tensor allocations per decode step across the 6 GDN cache groups in `TP4 + DCP2`.
 - **Diff**:
 ```diff
 diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
@@ -819,84 +1667,77 @@ index 3fb9816..34f5ce9 100644
 
 ---
 
-### 8.6 `vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py` & `vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py` (Optimization 3.3: NVFP4 MoE Workspace & Dispatch Cleanup)
+### 8.9 `vllm/v1/worker/gpu_model_runner.py` (Optimization D12: Gate `dcp_local_seq_lens` CPU Calculation & H2D Copy on `is_deepseek_mla` in `ModelRunnerV1`)
 
-- **Why**: Caches per-device `arange` index buffers across all 48 MoE layers and skips redundant `output.zero_()`, `buffers["permuted_idx"].fill_(slots)`, and `topk_ids_i32.copy_(topk_ids)` when `layer.expert_map is None` and `topk_ids` is already contiguous `int32`.
+- **Why**: Skips computing and copying `dcp_local_seq_lens` (and cloning it in `SpecDecodeBaseProposer`) when `is_deepseek_mla` is `False`.
 - **Diff**:
 ```diff
-diff --git a/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py b/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
-index 15b070d..5f397a2 100644
---- a/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
-+++ b/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
-@@ -18,6 +18,16 @@ from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 001204b..44268e2 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5293,7 +5293,7 @@ class GPUModelRunner(
+             ]
+             return current_mamba_state_block_ids_by_gid[kv_cache_gid]
 
-
- class NvFp4MoEWorkspace:
-+    _eager_arange_cache: dict[torch.device, torch.Tensor] = {}
-+
-+    @classmethod
-+    def _get_eager_arange(cls, device: torch.device, length: int) -> torch.Tensor:
-+        buf = cls._eager_arange_cache.get(device)
-+        if buf is None or buf.numel() < length:
-+            buf = torch.arange(length, dtype=torch.int32, device=device)
-+            cls._eager_arange_cache[device] = buf
-+        return buf
-...
--    @staticmethod
-+    @classmethod
-     def _eager_buffers(
--        layer: RoutedExperts, num_tokens: int, indexed_w13: bool
-+        cls, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
-     ) -> dict[str, torch.Tensor]:
-         device = layer.w13_tm_weight.device
-         top_k = int(layer.sm70_nvfp4_top_k)
-@@ -136,6 +146,7 @@ class NvFp4MoEWorkspace:
-         workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-             slots, layer.global_num_experts
-         )
-+        arange_buf = cls._get_eager_arange(device, slots + 1)
-         return {
-...
--            "token_expert_indices": torch.arange(
--                slots, dtype=torch.int32, device=device
--            ).view(num_tokens, top_k),
-+            "token_expert_indices": arange_buf[:slots].view(num_tokens, top_k),
-...
--            "compact_offsets": torch.arange(
--                slots + 1, dtype=torch.int32, device=device
--            ),
-+            "compact_offsets": arange_buf[: slots + 1],
-             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
-         }
-
-diff --git a/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py b/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
-index 2a39f1e..c2edaaf 100644
---- a/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
-+++ b/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
-@@ -1411,10 +1411,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
-             stage_expert_ids = buffers["active_expert_ids"]
-             stage_experts = slots
-         else:
--            output.zero_()
--            topk_ids_i32 = buffers["topk_ids"]
--            topk_ids_i32.copy_(topk_ids, non_blocking=True)
--            buffers["permuted_idx"].fill_(slots)
-+            if layer.expert_map is not None:
-+                output.zero_()
-+                buffers["permuted_idx"].fill_(slots)
-+            if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
-+                topk_ids_i32 = topk_ids
-+            else:
-+                topk_ids_i32 = buffers["topk_ids"]
-+                topk_ids_i32.copy_(topk_ids, non_blocking=True)
-             if indexed_w13:
+-        if self.dcp_world_size > 1:
++        if self.dcp_world_size > 1 and self.model_config.is_deepseek_mla:
+             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
+                 self.optimistic_seq_lens_cpu[:num_reqs],
+                 self.dcp_world_size,
 ```
 
 ---
 
-### 8.7 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` & `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` (Optimization 3.4: GDN Tail-Split Grid Shrink & Prefill Admission)
+### 8.10 `vllm/v1/worker/gpu/model_runner.py` (Optimization D12: Gate `prepare_dcp_local_seq_lens` Triton Kernel on `is_deepseek_mla` in `ModelRunnerV2`)
 
-- **Why**: Shrinks the `_qwen38_gdn_projection_split_kernel` grid when `COPY_QKV=False` from `(m, 16)` to `(m, 6)` (eliminating 9/16 no-op CTAs per row and wasted `qkv` HBM loads) and admits `mixed_qkvz.shape[0] > 1` in `qwen_gdn_input_projection_core`.
+- **Why**: Skips launching `_dcp_local_seq_lens_kernel` on every step when `is_deepseek_mla` is `False`.
+- **Diff**:
+```diff
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 324b32e..7f46a44 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1085,7 +1085,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+
+         dcp_local_seq_lens = None
+-        if self.use_dcp:
++        if self.use_dcp and self.model_config.is_deepseek_mla:
+             # Prepare dcp local seq_lens.
+             prepare_dcp_local_seq_lens(
+                 self.input_buffers.dcp_local_seq_lens,
+```
+
+---
+
+### 8.11 `vllm/v1/worker/gpu/cudagraph_utils.py` (Optimization D12: Gate Dummy `prepare_dcp_local_seq_lens` on `ag.backend.is_mla()` during Graph Capture)
+
+- **Why**: Skips launching `_dcp_local_seq_lens_kernel` during CUDA graph capture when no attention group uses MLA.
+- **Diff**:
+```diff
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 1b04912..adf13da 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -809,7 +809,9 @@ def prepare_inputs_to_capture(
+     )
+
+     # HACK(woosuk): Special handling for DCP.
+-    if block_tables.cp_size > 1:
++    if block_tables.cp_size > 1 and any(
++        ag.backend.is_mla() for group in attn_groups for ag in group
++    ):
+         prepare_dcp_local_seq_lens(
+             input_buffers.dcp_local_seq_lens,
+             input_batch.seq_lens,
+```
+
+---
+
+### 8.12 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` (Optimization 3.4: GDN Input Projection Tail-Split Grid Shrink (`(m, 16)` -> `(m, 6)`))
+
+- **Why**: Offsets `COPY_QKV=False` column indexing directly to `QKV = 2560` and shrinks the 2D launch grid from 16 column blocks to 6, eliminating 62.5% of CTAs and all unused `qkv` HBM loads.
 - **Diff**:
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py b/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
@@ -931,7 +1772,15 @@ index 14b4750..ecedc69 100644
          qkvz,
          ba,
          qkv,
+```
 
+---
+
+### 8.13 `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` (Optimization 3.4: Enable Fused `_split_gdn_projection_tails` for Prefill (`M > 1`))
+
+- **Why**: Relaxes `mixed_qkvz.shape[0] in (5, 20)` to `mixed_qkvz.shape[0] > 1` so prefill batches also fuse the `(b, a, z)` tail extraction into a single kernel launch.
+- **Diff**:
+```diff
 diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 index a82ba15..f517f21 100644
 --- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
@@ -945,4 +1794,107 @@ index a82ba15..f517f21 100644
              and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
              and self.value_dim // self.tp_size == 1536
              and z_out.shape == (mixed_qkvz.shape[0], 12, 128)
+```
+
+---
+
+### 8.14 `vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py` (Optimization 3.3: Persistent Read-Only `arange` Buffer in `NvFp4MoEWorkspace._eager_buffers`)
+
+- **Why**: Replaces 96 per-layer `torch.arange` GPU kernel launches and allocations per prefill chunk with views into a cached per-device `int32` sequence buffer.
+- **Diff**:
+```diff
+diff --git a/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py b/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
+index 15b070d..5f397a2 100644
+--- a/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
++++ b/vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py
+@@ -18,6 +18,16 @@ from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import
+
+
+ class NvFp4MoEWorkspace:
++    _eager_arange_cache: dict[torch.device, torch.Tensor] = {}
++
++    @classmethod
++    def _get_eager_arange(cls, device: torch.device, length: int) -> torch.Tensor:
++        buf = cls._eager_arange_cache.get(device)
++        if buf is None or buf.numel() < length:
++            buf = torch.arange(length, dtype=torch.int32, device=device)
++            cls._eager_arange_cache[device] = buf
++        return buf
++
+     @classmethod
+     def allocate(cls, layer: RoutedExperts) -> None:
+         device = layer.w13_tm_weight.device
+@@ -123,9 +133,9 @@ class NvFp4MoEWorkspace:
+             "active_expert_ids": layer._nvfp4_sm70_active_expert_ids[:slots],
+         }
+
+-    @staticmethod
++    @classmethod
+     def _eager_buffers(
+-        layer: RoutedExperts, num_tokens: int, indexed_w13: bool
++        cls, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
+     ) -> dict[str, torch.Tensor]:
+         device = layer.w13_tm_weight.device
+         top_k = int(layer.sm70_nvfp4_top_k)
+@@ -136,6 +146,7 @@ class NvFp4MoEWorkspace:
+         workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
+             slots, layer.global_num_experts
+         )
++        arange_buf = cls._get_eager_arange(device, slots + 1)
+         return {
+             "output": torch.empty(
+                 num_tokens, hidden, dtype=torch.float16, device=device
+@@ -171,9 +182,7 @@ class NvFp4MoEWorkspace:
+             "topk_ids": torch.empty(
+                 num_tokens, top_k, dtype=torch.int32, device=device
+             ),
+-            "token_expert_indices": torch.arange(
+-                slots, dtype=torch.int32, device=device
+-            ).view(num_tokens, top_k),
++            "token_expert_indices": arange_buf[:slots].view(num_tokens, top_k),
+             "permuted_idx": torch.empty(slots, dtype=torch.int32, device=device),
+             "sort_workspace": torch.empty(
+                 workspace_size, dtype=torch.int8, device=device
+@@ -182,9 +191,7 @@ class NvFp4MoEWorkspace:
+             "sorted_row_idx": torch.empty(slots, dtype=torch.int32, device=device),
+             "topk_ids_for_sort": torch.empty(slots, dtype=torch.int32, device=device),
+             "dense_expert_ids": layer._nvfp4_sm70_dense_expert_ids,
+-            "compact_offsets": torch.arange(
+-                slots + 1, dtype=torch.int32, device=device
+-            ),
++            "compact_offsets": arange_buf[: slots + 1],
+             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
+         }
+```
+
+---
+
+### 8.15 `vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py` (Optimization 3.3: Eliminate Redundant `output.zero_()`, `permuted_idx.fill_()`, and `topk_ids` Copy in NVFP4 MoE)
+
+- **Why**: Guards `output.zero_()` and `permuted_idx.fill_(slots)` behind `if layer.expert_map is not None:` and reuses contiguous `int32` `topk_ids` without copying.
+- **Diff**:
+```diff
+diff --git a/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py b/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
+index 2a39f1e..c2edaaf 100644
+--- a/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
++++ b/vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py
+@@ -1411,10 +1411,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
+             stage_expert_ids = buffers["active_expert_ids"]
+             stage_experts = slots
+         else:
+-            output.zero_()
+-            topk_ids_i32 = buffers["topk_ids"]
+-            topk_ids_i32.copy_(topk_ids, non_blocking=True)
+-            buffers["permuted_idx"].fill_(slots)
++            if layer.expert_map is not None:
++                output.zero_()
++                buffers["permuted_idx"].fill_(slots)
++            if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
++                topk_ids_i32 = topk_ids
++            else:
++                topk_ids_i32 = buffers["topk_ids"]
++                topk_ids_i32.copy_(topk_ids, non_blocking=True)
+             if indexed_w13:
+                 self.native_ops.moe_permute_metadata_with_scratch(
+                     x,
 ```

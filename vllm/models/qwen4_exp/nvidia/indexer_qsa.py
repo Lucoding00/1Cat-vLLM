@@ -166,6 +166,28 @@ class QSAIndexer(nn.Module):
             cache_config=cache_config,
             vllm_config=vllm_config,
         )
+        self._q_buffer: torch.Tensor | None = None
+
+    def _get_q_buffer(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        needed = num_tokens * self.index_n_heads * self.index_head_dim
+        buf = self._q_buffer
+        if (
+            buf is None
+            or buf.numel() < needed
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
+            cap = 1 << (max(needed, 1) - 1).bit_length()
+            if buf is not None and buf.device == device and buf.dtype == dtype:
+                cap = max(cap, buf.numel())
+            buf = torch.empty((cap,), dtype=dtype, device=device)
+            self._q_buffer = buf
+        return buf[:needed].view(num_tokens, self.index_n_heads, self.index_head_dim)
 
     @property
     def output_width(self) -> int:
@@ -248,11 +270,7 @@ class QSAIndexer(nn.Module):
         compressed_key_cache = self.compressed_key_cache.kv_cache
 
         if self.use_fused_pre_indexer:
-            q = projected_q.new_empty(
-                num_tokens,
-                self.index_n_heads,
-                self.index_head_dim,
-            )
+            q = self._get_q_buffer(num_tokens, projected_q.dtype, projected_q.device)
             qsa_pre_indexer(
                 projected_q,
                 raw_keys,
@@ -362,6 +380,7 @@ class QSAIndexer(nn.Module):
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
             visible_blocks_cache=compressed_metadata.visible_blocks_cache,
+            max_seq_len=compressed_metadata.max_seq_len,
         )
 
 

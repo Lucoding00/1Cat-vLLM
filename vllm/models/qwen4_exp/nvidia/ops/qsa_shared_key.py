@@ -59,14 +59,38 @@ def shared_key_reason(q, cache, table, requests, positions, lengths):
 
 
 def maybe_shared_key_scores(
-    q, cache, table, requests, positions, lengths, compress, columns, divisor
+    q,
+    cache,
+    table,
+    requests,
+    positions,
+    lengths,
+    compress,
+    columns,
+    divisor,
+    scores: torch.Tensor | None = None,
+    visible: torch.Tensor | None = None,
 ):
     reason = shared_key_reason(q, cache, table, requests, positions, lengths)
     if reason is not None:
         logger.info_once("SM70 QSA shared-key scorer fallback: %s.", reason)
         return None
-    scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    if (
+        scores is None
+        or scores.shape != (q.shape[0], columns)
+        or scores.dtype != torch.float32
+        or scores.device != q.device
+        or not scores.is_contiguous()
+    ):
+        scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    if (
+        visible is None
+        or visible.shape != (q.shape[0],)
+        or visible.dtype != torch.int32
+        or visible.device != q.device
+        or not visible.is_contiguous()
+    ):
+        visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     torch.ops.vllm_sm70_qsa_indexer.run(
         scores,
         visible,

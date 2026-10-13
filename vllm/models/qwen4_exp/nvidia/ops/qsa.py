@@ -74,6 +74,10 @@ _SM70_QSA_SPLITK_WORKSPACES: dict[
     tuple[int, int],
     tuple[int, int, torch.Tensor, torch.Tensor],
 ] = {}
+_SM70_QSA_SELECTOR_WORKSPACES: dict[
+    tuple[int, int],
+    tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
 
 
@@ -707,89 +711,92 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=columns < TOPK,
             other=-1,
         )
-        safe_token = tl.maximum(logical_token, 0)
-        logical_page = safe_token // PAGE_SIZE
-        page_offset = safe_token % PAGE_SIZE
-        valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
-        if DEVICE_HISTORY:
-            valid &= (logical_token <= position) & (logical_token < length)
-        if RESOLVED_INDICES:
-            physical_page = logical_page
-        else:
-            valid &= logical_page < PAGE_TABLE_WIDTH
-            physical_page = tl.load(
-                block_table_ptr
-                + safe_request * stride_table_req
-                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-                mask=valid,
-                other=-1,
+        if tl.max(logical_token, axis=0) >= 0:
+            safe_token = tl.maximum(logical_token, 0)
+            logical_page = safe_token // PAGE_SIZE
+            page_offset = safe_token % PAGE_SIZE
+            valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+            if DEVICE_HISTORY:
+                valid &= (logical_token <= position) & (logical_token < length)
+            if RESOLVED_INDICES:
+                physical_page = logical_page
+            else:
+                valid &= logical_page < PAGE_TABLE_WIDTH
+                physical_page = tl.load(
+                    block_table_ptr
+                    + safe_request * stride_table_req
+                    + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                    mask=valid,
+                    other=-1,
+                )
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+            # physical_page * block stride can overflow int32 for large caches.
+            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+            if HOST_CACHE:
+                hot_tokens = tl.load(
+                    HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
+                )
+                valid &= hot_tokens >= -1
+            if HOST_CACHE:
+                keys, values = load_host_kv(
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    hot_tokens,
+                    row,
+                    columns,
+                    valid,
+                    dim_offsets,
+                    tl.cdiv(TOPK, 4) * 4,
+                    HEAD_DIM,
+                )
+            else:
+                keys = tl.load(
+                    k_cache_ptr
+                    + safe_page[None, :] * stride_k_block
+                    + page_offset[None, :] * stride_k_token
+                    + kv_head * stride_k_head
+                    + dim_offsets[:, None],
+                    mask=valid[None, :],
+                    other=0.0,
+                )
+                values = tl.load(
+                    v_cache_ptr
+                    + safe_page[:, None] * stride_v_block
+                    + page_offset[:, None] * stride_v_token
+                    + kv_head * stride_v_head
+                    + dim_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
+            if DEVICE_HISTORY and HISTORY_E4M3:
+                slot = safe_page * PAGE_SIZE + page_offset
+                key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
+                value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
+                keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
+                    query.dtype
+                )
+                values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+                    query.dtype
+                )
+            if KV_E4M3:
+                keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
+                values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
+            scores = tl.dot(query, keys)
+            # Scaling scores avoids re-quantizing a scaled query to BF16.
+            scores *= qk_scale_log2
+            scores = tl.where(valid[None, :], scores, -1.0e20)
+            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.where(
+                valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
             )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        if HOST_CACHE:
-            hot_tokens = tl.load(
-                HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
             )
-            valid &= hot_tokens >= -1
-        if HOST_CACHE:
-            keys, values = load_host_kv(
-                k_cache_ptr,
-                v_cache_ptr,
-                hot_tokens,
-                row,
-                columns,
-                valid,
-                dim_offsets,
-                tl.cdiv(TOPK, 4) * 4,
-                HEAD_DIM,
-            )
-        else:
-            keys = tl.load(
-                k_cache_ptr
-                + safe_page[None, :] * stride_k_block
-                + page_offset[None, :] * stride_k_token
-                + kv_head * stride_k_head
-                + dim_offsets[:, None],
-                mask=valid[None, :],
-                other=0.0,
-            )
-            values = tl.load(
-                v_cache_ptr
-                + safe_page[:, None] * stride_v_block
-                + page_offset[:, None] * stride_v_token
-                + kv_head * stride_v_head
-                + dim_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
-        if DEVICE_HISTORY and HISTORY_E4M3:
-            slot = safe_page * PAGE_SIZE + page_offset
-            key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
-            value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
-                query.dtype
-            )
-        if KV_E4M3:
-            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
-            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
-        scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= qk_scale_log2
-        scores = tl.where(valid[None, :], scores, -1.0e20)
-        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.where(
-            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
-        )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
-        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
-        max_value = next_max
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+            max_value = next_max
 
     has_values = normalizer > 0
     normalized_output = tl.where(
@@ -1178,6 +1185,8 @@ def qsa_mqa_paged(
     num_columns: int | None = None,
     score_scale: float | None = None,
     shared_key_scoring: bool = False,
+    out_logits: torch.Tensor | None = None,
+    out_visible_blocks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -1221,11 +1230,31 @@ def qsa_mqa_paged(
             compress_ratio,
             columns,
             score_divisor,
+            scores=out_logits,
+            visible=out_visible_blocks,
         )
         if result is not None:
             return result
-    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    if (
+        out_logits is not None
+        and out_logits.shape == (q.shape[0], columns)
+        and out_logits.dtype == torch.float32
+        and out_logits.device == q.device
+        and out_logits.is_contiguous()
+    ):
+        logits = out_logits
+    else:
+        logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    if (
+        out_visible_blocks is not None
+        and out_visible_blocks.shape == (q.shape[0],)
+        and out_visible_blocks.dtype == torch.int32
+        and out_visible_blocks.device == q.device
+        and out_visible_blocks.is_contiguous()
+    ):
+        visible_blocks = out_visible_blocks
+    else:
+        visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
@@ -1591,6 +1620,87 @@ def _qsa_select_by_request(
     return True
 
 
+def _qsa_bounded_decode_score_columns(
+    q: torch.Tensor,
+    capacity_columns: int,
+    block_topk: int,
+    compress_ratio: int,
+    max_seq_len: int | None,
+) -> int:
+    if capacity_columns <= 0 or compress_ratio <= 0:
+        return capacity_columns
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    capturing = bool(q.is_cuda and torch.cuda.is_current_stream_capturing())
+    bound_seq_len: int | None = None
+    if is_forward_context_available():
+        context = get_forward_context()
+        descriptor = context.batch_descriptor
+        bucket = getattr(descriptor, "attention_context_bucket", None)
+        if capturing or context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            bound_seq_len = bucket
+        else:
+            bound_seq_len = max_seq_len if max_seq_len is not None else bucket
+    elif not capturing:
+        bound_seq_len = max_seq_len
+    if bound_seq_len is None or bound_seq_len <= 0:
+        return capacity_columns
+    live_columns = ((bound_seq_len // compress_ratio + 63) // 64) * 64
+    return min(capacity_columns, max(block_topk, live_columns))
+
+
+def _qsa_selector_workspace(
+    q: torch.Tensor,
+    chunk_rows: int,
+    score_columns: int,
+    block_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (device_index, stream_id)
+    cache = workspace_cache("qsa_selector", _SM70_QSA_SELECTOR_WORKSPACES)
+    workspace = cache.get(key)
+    needed_logits = max(chunk_rows * score_columns, 1)
+    needed_visible = max(chunk_rows, 1)
+    needed_blocks = max(chunk_rows * block_topk, 1)
+    if (
+        workspace is None
+        or workspace[0] < needed_logits
+        or workspace[1] < needed_visible
+        or workspace[2] < needed_blocks
+    ):
+        logits_cap = 1 << (needed_logits - 1).bit_length()
+        visible_cap = 1 << (needed_visible - 1).bit_length()
+        blocks_cap = 1 << (needed_blocks - 1).bit_length()
+        if workspace is not None:
+            logits_cap = max(logits_cap, workspace[0])
+            visible_cap = max(visible_cap, workspace[1])
+            blocks_cap = max(blocks_cap, workspace[2])
+        logits_buf = torch.empty((logits_cap,), dtype=torch.float32, device=q.device)
+        visible_buf = torch.empty((visible_cap,), dtype=torch.int32, device=q.device)
+        blocks_buf = torch.empty((blocks_cap,), dtype=torch.int32, device=q.device)
+        workspace = (
+            logits_cap,
+            visible_cap,
+            blocks_cap,
+            logits_buf,
+            visible_buf,
+            blocks_buf,
+        )
+        cache[key] = workspace
+    retain_for_capture(cache, workspace, q)
+    _, _, _, logits_buf, visible_buf, blocks_buf = workspace
+    return (
+        logits_buf,
+        visible_buf,
+        blocks_buf[: chunk_rows * block_topk].view(chunk_rows, block_topk),
+    )
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1606,6 +1716,7 @@ def qsa_select_paged_tokens(
     visible_blocks_cache: dict[tuple[int, int, int], tuple[torch.Tensor, int]]
     | None = None,
     _cache_row_range: tuple[int, int] | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1682,13 +1793,26 @@ def qsa_select_paged_tokens(
                 k_cache, page_table, score_columns
             )
         else:
-            score_columns = capacity_columns
+            score_columns = _qsa_bounded_decode_score_columns(
+                q, capacity_columns, block_topk, compress_ratio, max_seq_len
+            )
             all_visible = None
+    else:
+        score_columns = _qsa_bounded_decode_score_columns(
+            q, capacity_columns, block_topk, compress_ratio, max_seq_len
+        )
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
-    blocks_buffer = torch.empty(
-        (chunk_rows, block_topk), dtype=torch.int32, device=q.device
-    )
+    if q.is_cuda:
+        logits_buf, visible_buf, blocks_buffer = _qsa_selector_workspace(
+            q, chunk_rows, score_columns, block_topk
+        )
+    else:
+        logits_buf = None
+        visible_buf = None
+        blocks_buffer = torch.empty(
+            (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+        )
     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
     topk_workspace = (
         None
@@ -1698,6 +1822,7 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
+        chunk_n = row_end - row_start
         if contiguous_keys is not None and key_valid is not None:
             assert all_visible is not None
             logits, visible_blocks = _qsa_mqa_cublas(
@@ -1707,6 +1832,16 @@ def qsa_select_paged_tokens(
                 all_visible[row_slice],
             )
         else:
+            paged_kwargs: dict[str, object] = {
+                "shared_key_scoring": shared_key_scoring,
+            }
+            if score_columns != capacity_columns:
+                paged_kwargs["num_columns"] = score_columns
+            if logits_buf is not None and visible_buf is not None:
+                paged_kwargs["out_logits"] = logits_buf[
+                    : chunk_n * score_columns
+                ].view(chunk_n, score_columns)
+                paged_kwargs["out_visible_blocks"] = visible_buf[:chunk_n]
             logits, visible_blocks = qsa_mqa_paged(
                 q[row_slice],
                 k_cache,
@@ -1715,9 +1850,9 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
-                shared_key_scoring=shared_key_scoring,
+                **paged_kwargs,  # type: ignore[arg-type]
             )
-        blocks = blocks_buffer[: row_end - row_start]
+        blocks = blocks_buffer[:chunk_n]
         use_cooperative_topk = (
             blocks.shape[0] <= 32
             and logits.stride(0) % 4 == 0
@@ -2412,6 +2547,7 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    pre_resolved_indices: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2516,10 +2652,10 @@ def qsa_sparse_paged_attention(
                 _qsa_output_gate(xqa_output, output_gate_view)
             return xqa_output
 
-    resolved_indices = _use_sm70_qsa_resolved_indices(
+    resolved_indices = pre_resolved_indices or _use_sm70_qsa_resolved_indices(
         q, k_cache, logical_indices, kv_cache_dtype
     )
-    if resolved_indices:
+    if resolved_indices and not pre_resolved_indices:
         physical_indices = torch.empty_like(logical_indices)
         _qsa_resolve_physical_indices_kernel[(1, triton.cdiv(2051, 256))](
             logical_indices,
@@ -2681,7 +2817,7 @@ def _use_sm70_qsa_two_warp_partial(
     """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
     return bool(
         0 < num_query_tokens <= 16
-        and group_size == 6
+        and group_size in (6, 12)
         and head_dim == 256
         and current_platform.is_device_capability(70)
     )

@@ -13,24 +13,55 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_cache_blocks", "num_requests"])
 def _localize_indices(
     src,
     dst,
     src_stride,
     dst_stride,
+    block_table_ptr,
+    token_to_req_ptr,
+    table_stride_req,
+    num_cache_blocks,
+    num_requests,
     WIDTH: tl.constexpr,
     OUT_WIDTH: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
     INTERLEAVE: tl.constexpr,
     BLOCK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr = 1,
+    PAGE_TABLE_WIDTH: tl.constexpr = 1,
+    RESOLVE_PHYSICAL: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
     token = tl.load(src + row * src_stride + col, col < WIDTH, other=-1)
     owned = (col < WIDTH) & (token >= 0) & ((token // INTERLEAVE) % WORLD == RANK)
     local = token // (WORLD * INTERLEAVE) * INTERLEAVE + token % INTERLEAVE
+    if RESOLVE_PHYSICAL:
+        request = tl.load(token_to_req_ptr + row)
+        safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+        safe_local = tl.maximum(local, 0)
+        logical_page = safe_local // PAGE_SIZE
+        page_offset = safe_local % PAGE_SIZE
+        valid_page = (
+            owned
+            & (request >= 0)
+            & (request < num_requests)
+            & (logical_page < PAGE_TABLE_WIDTH)
+        )
+        physical_page = tl.load(
+            block_table_ptr
+            + safe_request * table_stride_req
+            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+            mask=valid_page,
+            other=-1,
+        )
+        valid_phys = (
+            valid_page & (physical_page >= 0) & (physical_page < num_cache_blocks)
+        )
+        local = tl.where(valid_phys, physical_page * PAGE_SIZE + page_offset, -1)
     position = tl.cumsum(owned.to(tl.int32), 0) - 1
     count = tl.sum(owned.to(tl.int32), 0)
     # Disjoint writes avoid races between warp-local compaction and padding.
@@ -74,6 +105,9 @@ def qsa_localize_dcp_indices(
     dcp_rank: int,
     interleave_size: int,
     local_block_size: int,
+    block_table: torch.Tensor | None = None,
+    token_to_req: torch.Tensor | None = None,
+    num_cache_blocks: int | None = None,
 ) -> torch.Tensor:
     """Compact this rank's selected IDs into an independent persistent buffer.
 
@@ -116,16 +150,29 @@ def qsa_localize_dcp_indices(
         return out
     if not indices.is_cuda:
         raise ValueError("QSA DCP localization requires CUDA buffers")
+    resolve_physical = (
+        block_table is not None
+        and token_to_req is not None
+        and num_cache_blocks is not None
+    )
     _localize_indices[(indices.shape[0],)](
         indices,
         out,
         indices.stride(0),
         out.stride(0),
+        block_table,
+        token_to_req,
+        block_table.stride(0) if block_table is not None else 0,
+        num_cache_blocks if num_cache_blocks is not None else 0,
+        block_table.shape[0] if block_table is not None else 0,
         WIDTH=indices.shape[1],
         OUT_WIDTH=out.shape[1],
         WORLD=dcp_world_size,
         RANK=dcp_rank,
         INTERLEAVE=interleave_size,
         BLOCK=triton.next_power_of_2(indices.shape[1]),
+        PAGE_SIZE=local_block_size,
+        PAGE_TABLE_WIDTH=block_table.shape[1] if block_table is not None else 1,
+        RESOLVE_PHYSICAL=resolve_physical,
     )
     return out

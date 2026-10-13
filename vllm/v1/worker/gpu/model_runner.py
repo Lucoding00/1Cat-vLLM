@@ -1085,7 +1085,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
         dcp_local_seq_lens = None
-        if self.use_dcp:
+        if self.use_dcp and self.model_config.is_deepseek_mla:
             # Prepare dcp local seq_lens.
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
