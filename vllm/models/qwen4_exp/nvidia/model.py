@@ -621,8 +621,11 @@ def enable_sm70_hcx(
         status["prepared_modules"] += 1
         previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
     if previous_moe and model.hyper_connection_mixer is not None:
+        final_key = (
+            "mtp.final" if getattr(model, "mtp_start_layer_idx", 0) > 0 else "final"
+        )
         model.hyper_connection_mixer._hcx_moe_payload = True
-        model.hyper_connection_mixer.enable_partial_inputs("final")
+        model.hyper_connection_mixer.enable_partial_inputs(final_key, runtime)
     status.update(enabled=True, reason=None)
     logger.info_once("SM70 HCX loaded operator capability: %s.", str(status))
     return True
@@ -675,7 +678,12 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
             diagnostic=kernel_config.sm70_hcx_diagnostics,
         )
-        kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
+        selection_key = (
+            "hcx:draft"
+            if getattr(model, "mtp_start_layer_idx", 0) > 0
+            else "hcx:target"
+        )
+        kernel_config.collective_kernel_selections[selection_key] = model.sm70_hcx_status
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):

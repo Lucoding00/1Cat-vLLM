@@ -73,8 +73,26 @@ from .model import (
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _compact_topk_single_row_kernel(
+    buffer_ptr,
+    row_indices_ptr,
+    stride_row,
+    width,
+    BLOCK: tl.constexpr,
+):
+    src_row = tl.load(row_indices_ptr).to(tl.int64)
+    if src_row <= 0:
+        return
+    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    vals = tl.load(buffer_ptr + src_row * stride_row + cols, mask=mask)
+    tl.store(buffer_ptr + cols, vals, mask=mask)
 
 
 def _remap_ignored_layers(
@@ -435,10 +453,51 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         """Keep each request's target-aligned step-0 sparse-index row."""
 
         num_rows = row_indices.numel()
+        if num_rows <= 0:
+            return
+        seen_ptrs: set[int] = set()
         for attention in self._iter_qsa_attentions():
             buffer = attention.topk_indices_buffer
-            selected = buffer.index_select(0, row_indices)
-            buffer[:num_rows].copy_(selected)
+            ptr = buffer.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            width = buffer.shape[1]
+            if (
+                num_rows == 1
+                and HAS_TRITON
+                and buffer.device.type == "cuda"
+                and row_indices.device == buffer.device
+                and buffer.stride(1) == 1
+            ):
+                _compact_topk_single_row_kernel[(triton.cdiv(width, 256),)](
+                    buffer,
+                    row_indices,
+                    buffer.stride(0),
+                    width,
+                    BLOCK=256,
+                    num_warps=2,
+                )
+            elif buffer.device.type == "cuda":
+                scratch = getattr(self, "_compact_topk_scratch", None)
+                if (
+                    scratch is None
+                    or scratch.shape[0] < num_rows
+                    or scratch.shape[1] != width
+                    or scratch.dtype != buffer.dtype
+                    or scratch.device != buffer.device
+                ):
+                    cap = max(num_rows, buffer.shape[0])
+                    scratch = torch.empty(
+                        (cap, width), dtype=buffer.dtype, device=buffer.device
+                    )
+                    object.__setattr__(self, "_compact_topk_scratch", scratch)
+                selected = scratch[:num_rows]
+                torch.index_select(buffer, 0, row_indices, out=selected)
+                buffer[:num_rows].copy_(selected)
+            else:
+                selected = buffer.index_select(0, row_indices)
+                buffer[:num_rows].copy_(selected)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

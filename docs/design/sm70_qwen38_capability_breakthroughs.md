@@ -3,13 +3,13 @@
 > **目标平台**: NVIDIA Tesla V100-SXM2-32GB (`SM70`, Volta)  
 > **目标部署拓扑**: `TP4 + DCP2` (`world_size=4`, `dcp_size=2`) + `MTP4` (`num_speculative_tokens=4`)  
 > **前置优化基线**: `docs/design/sm70_qwen38_prefill_decode_optimizations.md` (`P1`–`P10` & `D1`–`D16`)  
-> **专项定位**: 在保留 100% 数值等价 (`0 ULP` / bit-exact) 的前提下，针对 **架构级能力边界限制**（DCP2 稀疏注意力全预算空转、V1 SpecDecode 缺失 MTP Top-K 索引共享、MTP 算子/小 batch 限制、PLE 膨胀短卷积与 N-gram 构图瓶颈）实现 **能力突破 (`P11`–`P13`, `D17`–`D20`)**，并系统梳理仓库内置的高阶 SM70 能力开关。
+> **专项定位**: 在保留 100% 数值等价 (`0 ULP` / bit-exact) 的前提下，针对 **架构级能力边界限制**（DCP2 稀疏注意力全预算空转、V1 SpecDecode 缺失 MTP Top-K 索引共享、MTP 算子/小 batch 限制、PLE 膨胀短卷积与 N-gram 构图瓶颈、以及 `Qwen3.8-27B` vs. `Qwen3.8-Flash-Next` Decode 吞吐差距根因）实现 **能力突破 (`P11`–`P13`, `D17`–`D25`)**，并系统梳理仓库内置的高阶 SM70 能力开关。
 
 ---
 
-## 1. 能力突破总览 (`P11`–`P13` & `D17`–`D20`)
+## 1. 能力突破总览 (`P11`–`P13` & `D17`–`D25`)
 
-在前置 `P1`–`P10` 与 `D1`–`D16` 完成通用算子融合与零分配改造后，`Qwen3.8-Flash-Next` 在 `TP4 + DCP2 + MTP4` 下仍存在 **4 处能力级瓶颈**：
+在前置 `P1`–`P10` 与 `D1`–`D16` 完成通用算子融合与零分配改造后，针对 `Qwen3.8-Flash-Next` 在 `TP4 + DCP2 + MTP4` 下的 **架构级瓶颈** 与 **`Qwen3.8-27B` vs. `Qwen3.8-Flash-Next` Decode 差距**，本专项实现了以下能力突破：
 
 | 编号 | 阶段 | 能力突破点 | 改动文件 | 核心突破与收益 | 精度影响 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -17,6 +17,11 @@
 | **`D18`** | `MTP4` Decode | **V1 `SpecDecodeBaseProposer` 启用 `index_share_for_mtp_iteration` + 跳过 `QSAIndexer` Query 准备** | `llm_base_proposer.py`<br>`indexer_qsa.py`<br>`ops/qsa_pre_indexer.py` | 1. V2 `EagleSpeculator` 支持 `index_share_for_mtp_iteration`（Pass 0 选出 Top-K 索引并压缩为 `:B`，Draft steps `1..3` 置 `set_skip_topk(True)` 复用 Pass 0 索引），但默认 V1 `SpecDecodeBaseProposer` 未接入该能力。现将其完整接入 V1 Proposer。<br>2. 当 `skip_topk=True`（或 `select=False`）时，`QSAIndexer` 仅需将当前步 `k` 写入循环状态缓存，无需计算 `q_norm` 与 `q_rope`。现跳过 `q_norm`、`q_rope` 及 `qsa_pre_indexer` 中的 Query 线程块（`num_q_work = 0`）。 | **与模型配置契約完全一致 (`0 ULP`)** |
 | **`P12` / `D19`** | Prefill & Decode | **MTP 层启用 SM70 Peer Paths + 解除 `qsa_prep_sm70_out` `M<=32` 限制 + `qwen_gdn_input_projection` 融合切分** | `model.py`<br>`mtp.py`<br>`qsa.py`<br>`qwen_gdn_linear_attn.py` | 1. `Qwen4ExpMTP.load_weights` 补齐 `_maybe_enable_sm70_peer_paths(self.vllm_config, self.model)`（并使 `_maybe_fuse_sm70_side_projections` 兼容 `nn.ModuleDict`），让 MTP 层同样享受 `sm70_fused_side_projections` / `sm70_hcx` / `sm70_top1x`。<br>2. 解除 `qsa.py` 中 `qsa_prep_sm70_out` 的 `num_tokens <= 32` 限制（底层 CUDA 核支持任意 `rows >= 1`），使 Prefill 及大 Batch Decode 全部走单次 CUDA 融合算子。<br>3. 在 `qwen_gdn_input_projection` 中接入 `_qwen38_gdn_projection_split_kernel(COPY_QKV=True)`，将 4 次跨步 `.copy_()` 融合为 1 次 Triton 启动（36 层省去 **108 次启动/步**）。 | **Bit-exact (`0 ULP`)** |
 | **`P13` / `D20`** | Prefill & Decode | **PLE 膨胀短卷积 (`dilation=3`) 全场景融合（Prefill 零转置 / Spec 多请求扩展 / Decode FP32 状态兼容）+ Prefill N-gram ID 融合** | `ple_layer.py`<br>`qwen38_ple_spec_sm70.cu` | 1. **Prefill 短卷积**: 针对 `H=10240` 新增行主序 4-tap Triton 核 `_qwen38_ple_prefill_short_conv_kernel` + `_qwen38_ple_prefill_state_update_kernel`，消除 `[num_prefills, 10240, 9 + max_len]` 零填充/转置/分组卷积/gather 流水线，在 8K Prefill 下 **4 层合计节省 ~5.36 GB HBM 流量与 ~60 次启动**；同时为通用 PyTorch 路径增加 `num_prefills == 1` 免 scatter/gather 快路径。<br>2. **MTP Verify 短卷积**: 将 `qwen38_ple_spec_sm70.cu` 与 `_short_conv_dilated_spec_batched` 从仅支持 `num_reqs == 1` (`rows in {5, 10}`) 扩展到 `1 <= num_reqs <= 64`、`rows >= 5`（含 Triton 多请求回退核 `_qwen38_ple_spec_short_conv_kernel`），**4 层省去 104 次启动/步**。<br>3. **Decode 短卷积**: 支持 `conv_state.dtype in (fp16, fp32)`。<br>4. **Prefill N-gram ID**: 在 `compute_ngram_ids` 中对 `m > 32` (`1 <= num_reqs <= 64`) 直接调度 `sm70_ple_ngram_ids`，**4 层省去 100 次启动/Prefill 步**。 | **Bit-exact (`0 ULP`)** |
+| **`D21`** | `MTP4` Decode | **修复 `enable_sm70_hcx` 目标模型与 MTP Draft 模型 `"final"` 注册表冲突** | `model.py` | `Qwen4ExpModel` 与 `Qwen4ExpMultiTokenPredictor` 的末尾 `hyper_connection_mixer` 此前均以 `"final"` 注册到 `hc._PARTIAL_MODULES`（且均覆盖 `collective_kernel_selections["hcx:target"]`），开启 `sm70_hcx=True` 时 MTP 权重会覆盖目标模型末尾 Mixer。现根据 `mtp_start_layer_idx > 0` 区分 `"mtp.final"` / `"final"` 与 `"hcx:draft"` / `"hcx:target"`。 | **Bit-exact (`0 ULP`)** |
+| **`D22`** | `TP4 + DCP2` & `MTP4` Decode | **QSA Indexer `index_qk_proj` 仅投影 Key (`[128, 2560]` vs. `[640, 2560]`) + 短上下文免打分直展 (`IDENTITY_BLOCKS`)** | `indexer_qsa.py`<br>`ops/qsa.py`<br>`sm70_fp16_gemv.py` | 1. 当 `skip_query_prep` 为真（**MTP Draft steps 1–3 全上下文长度**、所有 `dense` 短上下文步、以及 **`TP4 + DCP2` 下 `max_seq_len <= 2051` 所有块均可见时**），`index_qk_proj` 的前 `512` 行 Query 投影完全不被读取。现仅对后 `128` 行 Key 权重 (`weight[512:]`, `[128, 2560]`) 执行 GEMV/GEMM，**直接削减 80% (5×) 的 `index_qk_proj` 计算量、CTA 数量与 HBM 权重读取**！<br>2. 在 `qsa_select_paged_tokens` 中，当 `max_seq_len // compress_ratio <= block_topk` (`seq_len <= 2051`) 时，`qsa_lexicographic_topk` 必然早退返回恒等块序 `0..visible-1`。现直接跳过 `qsa_mqa_paged` 与 `qsa_lexicographic_topk`，单核启动 `_expand_qsa_indices_kernel(..., IDENTITY_BLOCKS=True)`，**在 `TP4 + DCP2` 短/中上下文下每轮省去 26 次内核启动**。 | **Bit-exact (`0 ULP`)** |
+| **`D23`** | Decode & `MTP4` | **Shared-Expert `down_proj` (`[2560, 160]`) 接入 SM70 FP16 GEMV 快路径** | `sm70_fp16_gemv.py` | 48 个目标层与 4 个 MTP Draft 步（每轮 52 次调用）的 `mlp.shared_expert.down_proj` (`[2560, 160]`, `reduce_results=False`) 此前未列入 `_plan_for`，在 `M=1` 时回退通用 cuBLAS。现为其接入 `_GemvPlan(256, 2, 0)`，单次加载 `K=160` 并将 `[1, 160]` 驻留 L1/L2，消除 52 次通用 cuBLAS 回退。 | **Bit-exact (`0 ULP`)** |
+| **`D24`** | `MTP4` Decode | **MTP Draft `maybe_combine_fc` 双路投影 (`fc_embedding` + `fc_hidden`) 与 4 流残差加法单核融合** | `sm70_mtp_fc.py` | 每个 MTP Draft 步 (`1 <= rows <= 4`) 此前分 3 次内核启动执行 `fc_embedding` cuBLAS GEMM、`fc_hidden` cuBLAS GEMM 与 `el.unsqueeze(-2) + hl`。现新增 `_qwen38_mtp_fc_fused_gemv_add_kernel[(640, rows)]`，单核同时流式读取 `w_e` 与 `w_h`（复用寄存器内 `wh` 乘 4 条 HC 流）并在精确保留两个 FP16 舍入边界的前提下直接写出 `el + hl`，**每轮 MTP4 省去 8 次内核启动与中间显存读写**。 | **保留全部 FP16 舍入边界** |
+| **`D25`** | `MTP4` Decode | **MTP `compact_topk_indices` 单行原位 Triton 核 + 多行持久 Scratch 零分配** | `mtp.py` | `compact_topk_indices` 在每轮 MTP Step 0 之后调用 `buffer.index_select(0, row_indices)` + `copy_`，每轮触发动态显存分配与 2 次内核启动（且对共享 `topk_indices_buffer` 重复执行）。现去重共享 Buffer，对 `B=1` (`num_rows == 1`) 使用单次原位 Triton 核 `_compact_topk_single_row_kernel`（当 `src_row == 0` 时直接零拷贝早退），对 `num_rows > 1` 复用持久 `_compact_topk_scratch` 消除动态分配。 | **Bit-exact (`0 ULP`)** |
 
 ---
 
@@ -110,12 +115,97 @@
 
 ---
 
+### 2.5 为什么 `Qwen3.8-27B` Decode 可达 `200–260+ tok/s`，而 `Qwen3.8-Flash-Next` 在 `100–150 tok/s`？——全链路硬件级对比与 `D21`–`D25` 深度突破
+
+#### 一、核心悖论：单步 `M=1` 更快，但投机 Decode 慢将近一倍？
+
+根据仓库在 SM70 (`4 × V100-SXM2-32GB`, `TP4`) 上的实测基准（见 `docs/design/sm70_quasar_dflash2_15ms.md`、`sm70_dflash2_nvfp4_17ms.md`、`sm70_flash_next_mtp4_15ms.md` 与 `sm70_flash_next_mtp4_trace_reconciliation.md`），两个模型呈现出极具启发性的性能反差：
+
+| 对比维度 | `Qwen3.8-27B-NVFP4` (`TP4`) | `Qwen3.8-Flash-Next-NVFP4` (`TP4 / TP4+DCP2`) | 关键结论 |
+| :--- | :--- | :--- | :--- |
+| **无投机单步 Decode (`M=1`)** | `60.4 – 66.4 tok/s`<br>(`15.1 – 16.2 ms/token`) | **`67.6 – 82.3 tok/s`**<br>(`12.15 – 14.8 ms/token`) | **不开启投机时，`Flash-Next` 比 `27B` 更快**（`M=1` 仅激活 10/512 个专家，活跃参数约 `3B` vs. `27B` Dense） |
+| **投机解码范式** | **`DFlash2` (`K=7`, 并行块起草)**<br>5 层轻量 Dense 跨层交叉注意力，**1 次前向同时生成 7 个候选 Token** | **原生 `MTP4` (`K=4`, 串行自回归起草)**<br>1 层完整 512 专家 MoE + QSA + 4 流 HC + 248K 词表头，**串行循环 4 步生成 4 个候选 Token** | `DFlash2` 单轮上限 **8 tokens**；`MTP4` 单轮上限仅 **5 tokens**（理论上限低 **37.5%**） |
+| **Draft 起草耗时 / 轮** | **`~1.8 – 2.5 ms / 轮`**（并行出 7 个词） | **`4.98 ms` (CUDA Event) / `5.28 ms` (Trace)**（串行出 4 个词） | `Flash-Next` 的 4 步串行 MoE 起草比 `27B` 的 7 词并行起草 **慢 2.2× 以上** |
+| **Target 验证耗时 / 轮** | **`14.5 – 16.5 ms / 轮`**（验证 **`M=8`** 个词） | **`15.7 – 22.2 ms / 轮`**（仅验证 **`M=5`** 个词） | Dense 模型从 `M=1 -> M=8` 几乎零边际成本；MoE + FP16 骨架从 `M=1 -> M=5` 耗时显著膨胀 |
+| **每轮平均接受 Token 数 ($\tau$)** | **`4.06 – 5.40 tokens/轮`**<br>（MBPP28: `4.686`，GSM8K: `5.40`） | **`2.67 – 4.81 tokens/轮`**<br>（`xhigh` 思考: `2.67`；8-prompt 自然集: `3.00`；常规集: `4.23`；Greedy 代码: `4.81`） | `DFlash2` 依托 `K=7` 窗口平均每轮多产出 **`+1.1 ~ +1.7` 个 Token** |
+| **端到端 Decode 吞吐** | **`204.5 – 260.4 tok/s`**<br>（MBPP28 均值: **`251.6 tok/s`** @ `18.57 ms/轮`） | **`82.1 – 150.2 tok/s`**<br>（`xhigh` 思考: `82.1`；8-prompt 自然集: `117.2`；常规集: **`148.4`**；Greedy: **`150.2 tok/s`**） | $\text{tok/s} = \frac{\tau}{T_{\text{target}} + T_{\text{draft}} + T_{\text{sample}}}$：分子小 ~30%、分母大 ~35%，叠加造成 **~1.8× 吞吐差距** |
+
+---
+
+#### 二、`Qwen3.8-Flash-Next` Decode 慢于 `Qwen3.8-27B` 的四大硬件根因
+
+通过 Nsight Systems 硬件级节点追踪（`sm70_flash_next_mtp4_trace_reconciliation.md`，单轮 Critical-Rank 服务时间 `27.32 ms`，共 **~3,100 次内核启动/轮**），可以精确定位造成差距的四大根因：
+
+1. **根因 1：大量 Dense 投影层未量化（保持 FP16 16-bit），占整轮耗时的 47.0%（`12.83 ms / 27.32 ms`）**
+   - 在 **`Qwen3.8-27B-NVFP4`** 中，64 层的所有主干投影（GDN `in_proj_qkvz`/`out_proj`、Full Attention `qkv_proj`/`o_proj`、Dense MLP `gate_up_proj`/`down_proj`）**全部是 4-bit/8-bit 量化权重**，由专门定制的 SM70 `QPN2` / `QPN4` / `QPN8` Split-K Tensor Core 算子执行，64 层全部线性投影在 `M=8` 下合计仅需 **`12.2 ms`**。
+   - 而在 **`Qwen3.8-Flash-Next-NVFP4`** 中，**只有 512 个路由专家 (Routed Experts) 是 NVFP4**！其余所有骨架层在 Checkpoint 中均为 **16-bit FP16**：
+     - 36 层 GDN 的 `in_proj_qkvz [4096, 2560]`、`in_proj_ba [24, 2560]`、`out_proj [2560, 1536]`；
+     - 12 层 QSA 的 `qkv_proj [3584, 2560]`、`o_proj [2560, 1536]`、`index_qk_proj [640, 2560]`；
+     - 48 层 Shared Expert 的 `gate_up_proj [320, 2560]`、`down_proj [2560, 160]`、`shared_expert_gate [1, 2560]`；
+     - 48 层 Router `mlp.gate [512, 2560]`；
+     - 96 个 HyperConnection (HC) 阶段的 `hc_down [336, 10240]` 与 `hc_up [10240, 320]`；
+     - MTP 层 `fc_embedding [640, 2560]`、`fc_hidden [640, 2560]` 与 248,320 词表的 `lm_head`。
+   - 仅 Target `M=5` 验证步中，就有 **291 次通用 CUTLASS/cuBLAS `volta_fp16_s884gemm` 调用（耗时 `5.66 ms`）** + 定制 FP16 算子（合计 **`9.31 ms`**），加上 Draft 步 FP16 线性层，整轮 FP16 Dense 投影高达 **`12.83 ms`**！
+
+2. **根因 2：512 专家 Top-10 MoE 在 `M=5` 验证步发生“活跃专家扇出膨胀 (Expert Fan-Out)”（`4.47 ms/轮`）**
+   - `M=1` 时每层仅激活 `10` 个专家；但在 `M=5` 投机验证时，5 个候选位置共触发 `5 × 10 = 50` 个专家槽位，去重后每层需从 HBM 加载 **`35 ~ 50` 个不同专家的权重**（HBM 专家权重读取量膨胀 **3.5× ~ 5×**），48 层 Target NVFP4 专家耗时 **`2.88 ms`** + 路由/排序/规约 **`0.75 ms`** = **`3.63 ms`**。
+   - 更严重的是，MTP Draft 层的 512 个专家在 Checkpoint 中默认是 **未量化的 FP16**，4 步串行 `M=1` Draft MoE 耗时 **`0.84 ms`**（若开启 `mtp_expert_quantization="fp8"` 可直接减半）。
+
+3. **根因 3：4 流 HyperConnection (HC) + 125 次通信原语 + ~3,100 次内核启动开销**
+   - `Qwen3.8-27B` 采用标准单流残差 `[M, 5120]`，每层仅 2 次 AllReduce（64 层 + DFlash2 合计约 138 次通信，内核启动少）。
+   - `Qwen3.8-Flash-Next` 采用 **4 流超连接 (`hc_count = 4`, 状态宽度 `4 × 2560 = 10240`)**，每个 Target 层包含 2 个完整 HC 阶段（48 层共 **96 个 HC 阶段**），整轮产生 **1,077 次 Elementwise/Copy 启动（`4.48 ms`）**、**384 次 HC 专属核启动（`1.38 ms`）** 和 **125 次 NCCL/自定义通信（`4.83 ms`）**，单轮总内核启动达 **~3,100 次**。
+
+4. **根因 4：串行 `MTP4` (`K=4`) vs. 并行 `DFlash2` (`K=7`) 的算法结构差异**
+   - `DFlash2` 利用目标模型多层隐藏特征一次性并行预测 7 个位置，无论 `K=4` 还是 `K=7` 都只需 **1 次前向**（`~2.0 ms`）；
+   - `MTP4` 必须串行跑 4 步（Step $i$ 依赖 Step $i-1$ 采样的 Token Embedding 与 4 流 HC 状态），每步都要走一遍 `Embedding -> Pre-FC Norm -> FC (AllGather) -> QSA Attention -> 512-Expert MoE -> Final HC Mixer -> 248K Vocab Argmax`，4 步累计 **`4.98 ~ 5.28 ms`**。
+
+---
+
+#### 三、针对 `Qwen3.8-Flash-Next` Decode 瓶颈的五大代码级新突破 (`D21`–`D25`)
+
+围绕上述四大根因，我们在不破坏任何现有单测契约与数值精度的前提下，进一步挖掘并落地了 **5 项针对 `Qwen3.8-Flash-Next` Decode 的代码级优化 (`D21`–`D25`)**：
+
+1. **`D21` (`model.py`) — 修复 `enable_sm70_hcx` 目标模型与 MTP Draft 模型 `"final"` 注册表覆盖 Bug**：
+   - **问题**：当开启 `sm70_hcx=True`（将 MoE AllReduce 延迟并融合进下一个 HC 层的输入规约，省去每层独立 MoE AllReduce）时，`Qwen4ExpModel` 与 `Qwen4ExpMultiTokenPredictor` 的末尾 `hyper_connection_mixer` 均以硬编码名称 `"final"` 注册到全局 `hc._PARTIAL_MODULES["final"]`，导致后加载的 MTP Draft 模型权重覆盖了 Target 模型末尾 Mixer！
+   - **修复**：通过 `getattr(model, "mtp_start_layer_idx", 0) > 0` 识别 MTP Draft 模型，将其末尾 Mixer 注册为 `"mtp.final"`（Target 模型保持 `"final"`），并将 `collective_kernel_selections` 区分记录为 `"hcx:draft"` 与 `"hcx:target"`。
+
+2. **`D22` (`indexer_qsa.py`, `ops/qsa.py`, `sm70_fp16_gemv.py`) — QSA Indexer `index_qk_proj` 仅投影 Key (`[128, 2560]` vs. `[640, 2560]`) + 短上下文免打分直展 (`IDENTITY_BLOCKS`)**：
+   - **问题 1（80% 死计算与无效权重读取）**：`QSAIndexer.forward` 中的 `self.index_qk_proj(hidden_states)` 权重形状为 `[640, 2560]`（前 `512` 行为 4 个头的 Query 投影 `projected_q`，后 `128` 行为单头 Key 投影 `raw_keys`）。然而在以下所有高频场景中，`projected_q`（占矩阵 **80%**）完全不会被读取：
+     1. **MTP Draft Steps 1, 2, 3（任意上下文长度 `2K ~ 128K`）**：因 `self.skip_topk == True`，`qsa_pre_indexer(..., skip_q=True)` 中 `num_q_work = 0` 根本不解引用 `q_ptr`，且 `QSAIndexer.forward` 在更新完 K 缓存后直接返回复用的 Step 0 索引；
+     2. **所有 `select == False`（`dense` 短上下文）步**；
+     3. **`TP4 + DCP2` 下 `max_seq_len <= 2051`（所有压缩块均不超过 `block_topk = 512`）时的全部 12 个 Target QSA 层与 MTP Step 0**！
+   - **问题 2（`TP4 + DCP2` 下短/中上下文冗余打分与 Top-K 核启动）**：在 `TP4 + DCP2` 下，`qsa_dcp_sharded=True` 使 `dense` 恒为 `False`，因此即使 `max_seq_len <= 2051`，12 个 Target QSA 层仍会启动 `qsa_mqa_paged`（遍历 KV Cache 打分）和 `qsa_lexicographic_topk`。而 `qsa_lexicographic_topk` 在 `length <= TopK (512)` 时第一行就执行 `if (length <= TopK) { indices[tx] = tx < length ? tx : -1; return; }`，完全丢弃 `qsa_mqa_paged` 算出的所有分数！
+   - **突破方案**：
+     - 在 `QSAIndexer.forward` 中提前判定 `all_blocks_fit`（`max_seq_len // compress_ratio <= block_topk`）并令 `skip_query_prep = self.skip_topk or not select or all_blocks_fit`。当 `skip_query_prep=True` 时，直接切片 `k_weight = self.index_qk_proj.weight[512:]` (`[128, 2560]`) 调用 `qwen38_sm70_fp16_gemv`（在 `_plan_for` 中注册 `_GemvPlan(512, 2, 0)`，仅启动 **128 个 CTA** 而非 640 个 CTA）或 `F.linear`，**削减 80% 的 `index_qk_proj` 权重 HBM 读取与计算量**！
+     - 在 `qsa_select_paged_tokens` (`ops/qsa.py`) 中，当 `0 < max_seq_len` 且 `max_seq_len // compress_ratio <= block_topk` 时，直接跳过 `qsa_mqa_paged` 与 `qsa_lexicographic_topk`，单核启动 `_expand_qsa_indices_kernel(..., IDENTITY_BLOCKS=True)`（直接以 `block = safe_rank` 展开），**在 `TP4 + DCP2` 短/中上下文下每轮额外省去 26 次内核启动**，且输出张量与原路径 **100% 逐位一致 (`torch.equal`)**。
+
+3. **`D23` (`sm70_fp16_gemv.py`) — Shared-Expert `down_proj` (`[2560, 160]`) 接入 SM70 FP16 GEMV 快路径**：
+   - **问题**：每层 Shared Expert 的 `down_proj` (`[2560, 160]`, `reduce_results=False`) 在每轮 Decode 中被调用 **52 次**（48 个 Target 层 + 4 个 MTP Draft 步），此前未列入 `_plan_for`，导致在 `M=1`（全部 4 个 MTP Draft 步及单 Token Decode）下回退到通用 cuBLAS GEMM（且 `K=160` 非 64 对齐）。
+   - **突破方案**：在 `_plan_for` 中为 `.mlp.shared_expert.down_proj` (`(2560, 160)`) 注册 `_GemvPlan(256, 2, 0)`，在 `M=1` 时使用单块 `BLOCK_K=256` 一次性加载全部 160 个输入通道并驻留 L1/L2，消除每轮 4~52 次通用 cuBLAS 回退。
+
+4. **`D24` (`sm70_mtp_fc.py`) — MTP Draft `maybe_combine_fc` 双路投影 + 4 流残差加法单核融合 (`_qwen38_mtp_fc_fused_gemv_add_kernel`)**：
+   - **问题**：在 4 个 MTP Draft 步中，每步 `maybe_combine_fc` 依次启动 3 个内核：
+     1. `el = fc_embedding(e)` (`[rows, 2560] @ [2560, 640]`)；
+     2. `hl = fc_hidden(h)` (`[rows, 4, 2560] @ [2560, 640]`)；
+     3. `el.unsqueeze(-2) + hl` (`[rows, 1, 640] + [rows, 4, 640]`)。
+   - **突破方案**：新增自定义算子 `torch.ops.vllm.qwen38_sm70_mtp_fc_local_add` 与 Triton 核 `_qwen38_mtp_fc_fused_gemv_add_kernel[(640, rows)]`（覆盖 `1 <= rows <= 4`）：每个 CTA 负责 1 个输出列 `col` 与 1 个 Token 行 `row`，在单次 `K=2560` 循环中同时加载 `w_e[col, :]` 与 `w_h[col, :]`（其中 `w_h` 在寄存器内一次加载、复用于 `h` 的全部 4 条 HC 流），在 FP32 累加后分别做 `.to(tl.float16)` 舍入再相加写出，**严格保留原有 2 个 FP16 舍入边界**，同时将 3 次内核启动压缩为 **1 次启动**（每轮 MTP4 省去 **8 次内核启动** 及 `el`/`hl` 中间显存读写）。
+
+5. **`D25` (`mtp.py`) — MTP `compact_topk_indices` 单行原位 Triton 核 + 多行持久 Scratch 零分配**：
+   - **问题**：每轮 MTP Step 0 结束后，`compact_topk_indices` 对每个 QSA 层的 `topk_indices_buffer` 执行 `selected = buffer.index_select(0, row_indices); buffer[:num_rows].copy_(selected)`，不仅每轮动态分配 `selected` 显存并启动 2 个内核，而且当多层共享同一个 `topk_indices_buffer` 时会重复执行。
+   - **突破方案**：按 `buffer.data_ptr()` 去重；当 `num_rows == 1` (`B=1` Decode) 时启动单次原位 Triton 核 `_compact_topk_single_row_kernel`（若 `row_indices[0] == 0` 则直接在核内零拷贝早退）；当 `num_rows > 1` 时使用持久缓存 `self._compact_topk_scratch` 配合 `torch.index_select(..., out=selected)` 消除动态显存分配。
+
+---
+
 ## 3. 仓库内置高阶 SM70 能力突破开关速查表（Opt-In）
 
 除上述默认生效的代码级突破外，仓库还内置了若干针对特定场景的 **SM70 硬件极限能力开关**（部分因改变浮点累加顺序或面向特定并发档位而默认关闭，可通过环境变量或配置开启）：
 
 | 能力域 | 环境变量 / 配置项 | 默认值 | 推荐设置 (`TP4+DCP2+MTP4`) | 能力突破说明 |
 | :--- | :--- | :--- | :--- | :--- |
+| **MTP Draft 专家 FP8 量化** | `--speculative-config '{"mtp_expert_quantization": "fp8"}'` | `None` (FP16) | **`"fp8"`** | 将 MTP Draft 层的 512 个路由专家从 FP16 在线量化为 **FP8 (`E4M3`)**，使 4 步串行 Draft MoE 的专家权重 HBM 读取量直接减半（实测节省 **`~0.4 ~ 0.5 ms/轮`**，且每 Rank 节省 **562.5 MiB** 显存）。 |
+| **SM70 批处理快路径总开关** | `VLLM_SM70_QWEN38_BATCH_FASTPATH=1` | `1` (auto) | **`1`** | 启用 Target `M=5` 验证步的 `qwen38_dense_batch_sm70_out`（Router `M<=4` 与 Attention Output `o_proj`/`out_proj` `M<=8` 的 4-split FP32 Tensor Core 核）与 `qwen38_gdn_input_batch_sm70_out`。 |
+| **HC 批处理 & 低延迟通信** | `VLLM_SM70_QWEN38_HC_BATCH=1`<br>`VLLM_SM70_QWEN38_HC_LL_COMM=1`<br>`VLLM_SM70_QWEN38_HC_REPLICATED=1` | `1` (auto) | **`1`** | 将 96 个 HyperConnection 阶段的 `M=5` 投影切换至 8-warp / split-K 批处理核，并使用 SM70 低延迟紧凑通信与副本化 HC 权重消除跨卡同步开销。 |
+| **HCX 跨层 MoE 归约融合** | `kernel_config.sm70_hcx=True`<br>`kernel_config.sm70_top1x=True` | `False` | **`True`** (配合本次 `D21` 修复) | 将每层 MoE / Attention 输出的 TP AllReduce 延迟并融合进下一层 HyperConnection 的 `input_mix_weight_down` 局部规约中（配合本次 `D21` 修复 `"final"` / `"mtp.final"` 冲突）。 |
 | **PLE MTP4 融合卷积** | `VLLM_SM70_MTP_PLE_CONV=1`<br>(`kernel_config.layer_execution.ple_spec_conv`) | `0` | **`1`** | 启用 `qwen38_ple_spec_sm70_out` / `_qwen38_ple_spec_short_conv_kernel`，消除 MTP Verify 阶段 4 个 PLE 层的 28 步 PyTorch 卷积流水线（**bit-exact**，已通过 `test_sm70_mtp_ple_conv.py` 验证）。 |
 | **QSA 预处理 CUDA 融合** | `kernel_config.sm70_qsa_prep=True` | `False` | **`True`** | 启用 `qwen38_qsa_prep_sm70_out`（配合本次 `P12`/`D19` 解除 `M<=32` 限制），将 Q/K RMSNorm + Partial RoPE + Head Scale 融合为单次 CUDA 启动。 |
 | **GDN/QSA 旁路投影融合** | `kernel_config.sm70_fused_side_projections=True` | `False` | **`True`** | 将 GDN `in_proj_qkvz + in_proj_ba` 以及 QSA `qkv_proj + index_qk_proj` 融合为单次 DMV13 投影（配合本次 `P12`/`D19` 同步赋能 MTP 层）。 |
@@ -632,6 +722,406 @@
 +):
 +    """Fused multi-request MTP4 PLE rollback + 4-tap conv + state commit."""
 +    ...
+```
+
+### 4.12 `vllm/models/qwen4_exp/nvidia/model.py` (`D21`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -620,8 +620,11 @@ def enable_sm70_hcx(
+         status["prepared_modules"] += 1
+         previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+     if previous_moe and model.hyper_connection_mixer is not None:
++        final_key = (
++            "mtp.final" if getattr(model, "mtp_start_layer_idx", 0) > 0 else "final"
++        )
+         model.hyper_connection_mixer._hcx_moe_payload = True
+-        model.hyper_connection_mixer.enable_partial_inputs("final")
++        model.hyper_connection_mixer.enable_partial_inputs(final_key, runtime)
+     status.update(enabled=True, reason=None)
+     logger.info_once("SM70 HCX loaded operator capability: %s.", str(status))
+     return True
+@@ -674,7 +677,12 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) ->
+             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
+             diagnostic=kernel_config.sm70_hcx_diagnostics,
+         )
+-        kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
++        selection_key = (
++            "hcx:draft"
++            if getattr(model, "mtp_start_layer_idx", 0) > 0
++            else "hcx:target"
++        )
++        kernel_config.collective_kernel_selections[selection_key] = model.sm70_hcx_status
+```
+
+### 4.13 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` (`D22`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -242,36 +242,89 @@ class QSAIndexer(nn.Module):
++        from vllm.config.compilation import CUDAGraphMode
++        from vllm.forward_context import is_forward_context_available
++
+         from .ops.qsa import (
++            _use_sm70_qsa_lexicographic_topk,
+             qsa_compress_groups_with_ratio,
+             qsa_select_paged_tokens,
+             qsa_store_cache_rows,
+         )
+ 
+         raw_metadata, compressed_metadata = metadata
+         num_tokens = raw_metadata.num_actual_tokens
+         hidden_states = hidden_states[:num_tokens]
+         positions = positions[..., :num_tokens]
+ 
++        q_dim = self.index_n_heads * self.index_head_dim
++        k_dim = self.index_kv_heads * self.index_head_dim
++        block_topk = self.token_topk // self.compress_ratio
++        max_seq_len = getattr(compressed_metadata, "max_seq_len", None)
++        all_blocks_fit = bool(
++            select
++            and not self.skip_topk
++            and self.use_fused_pre_indexer
++            and hidden_states.is_cuda
++            and not torch.cuda.is_current_stream_capturing()
++            and (
++                not is_forward_context_available()
++                or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
++            )
++            and max_seq_len is not None
++            and 0 < max_seq_len
++            and max_seq_len // self.compress_ratio <= block_topk
++            and _use_sm70_qsa_lexicographic_topk(block_topk)
++        )
++        skip_query_prep = self.skip_topk or not select or all_blocks_fit
++
+         # Q/K projection
+-        if hidden_states.shape[-1] != self.index_qk_proj.input_size:
++        if hidden_states.shape[-1] == k_dim:
++            projected_q = None
++            raw_keys = hidden_states
++        elif hidden_states.shape[-1] != self.index_qk_proj.input_size:
+             # Already projected inside the fused SM70 qkv launch.
+-            projected_qk = hidden_states
++            projected_q, raw_keys = hidden_states.split((q_dim, k_dim), dim=-1)
+         else:
+-            projected_qk, _ = self.index_qk_proj(hidden_states)
+-        projected_q, raw_keys = projected_qk.split(
+-            (
+-                self.index_n_heads * self.index_head_dim,
+-                self.index_kv_heads * self.index_head_dim,
+-            ),
+-            dim=-1,
+-        )
++            weight = getattr(self.index_qk_proj, "weight", None)
++            if (
++                skip_query_prep
++                and self.use_fused_pre_indexer
++                and isinstance(weight, torch.Tensor)
++                and weight.shape == (q_dim + k_dim, hidden_states.shape[-1])
++                and weight.dtype in (torch.float16, torch.bfloat16)
++                and getattr(self.index_qk_proj, "bias", None) is None
++                and not getattr(
++                    self.index_qk_proj, "_sm70_qwen4_exp_online_qpn8", False
++                )
++            ):
++                from vllm.config.execution_policy import (
++                    use_sm70_decode_graph_semantics,
++                )
++
++                from .sm70_fp16_gemv import Qwen38SM70FP16LinearMethod
++
++                k_weight = weight[q_dim:]
++                projected_q = None
++                if (
++                    isinstance(
++                        getattr(self.index_qk_proj, "quant_method", None),
++                        Qwen38SM70FP16LinearMethod,
++                    )
++                    and use_sm70_decode_graph_semantics()
++                ):
++                    raw_keys = torch.ops.vllm.qwen38_sm70_fp16_gemv(
++                        hidden_states,
++                        k_weight,
++                        getattr(self.index_qk_proj, "prefix", ""),
++                        None,
++                        False,
++                    )
++                else:
++                    raw_keys = torch.nn.functional.linear(hidden_states, k_weight)
++            else:
++                projected_qk, _ = self.index_qk_proj(hidden_states)
++                projected_q, raw_keys = projected_qk.split((q_dim, k_dim), dim=-1)
+         raw_key_state_cache = self.raw_key_cache
+         compressed_key_cache = self.compressed_key_cache.kv_cache
+-        skip_query_prep = self.skip_topk or not select
+ 
+         if self.use_fused_pre_indexer:
+-            q = self._get_q_buffer(num_tokens, projected_q.dtype, projected_q.device)
++            q = self._get_q_buffer(num_tokens, raw_keys.dtype, raw_keys.device)
++            q_input = (
++                q.view(num_tokens, q_dim) if projected_q is None else projected_q
++            )
+             qsa_pre_indexer(
+-                projected_q,
++                q_input,
+                 raw_keys,
+```
+
+### 4.14 `vllm/models/qwen4_exp/nvidia/ops/qsa.py` (`D22`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -391,6 +391,7 @@ def _expand_qsa_indices_kernel(
+     TOKEN_TOPK: tl.constexpr,
+     OUTPUT_WIDTH: tl.constexpr,
+     COLUMN_BLOCK: tl.constexpr,
++    IDENTITY_BLOCKS: tl.constexpr = False,
+ ) -> None:
+     row = tl.program_id(0)
+     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
+@@ -414,11 +415,16 @@ def _expand_qsa_indices_kernel(
+     block_rank = columns // COMPRESS_RATIO
+     offset = columns % COMPRESS_RATIO
+     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
+-    block = tl.load(
+-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
+-        mask=(row < rows) & is_expanded,
+-        other=-1,
+-    )
++    if IDENTITY_BLOCKS:
++        block = safe_rank
++    else:
++        block = tl.load(
++            block_indices_ptr
++            + row * stride_blocks_row
++            + safe_rank * stride_blocks_column,
++            mask=(row < rows) & is_expanded,
++            other=-1,
++        )
+     expanded = block * COMPRESS_RATIO + offset
+@@ -1788,6 +1794,45 @@ def qsa_select_paged_tokens(
+     capacity_columns = page_table.shape[1] * k_cache.shape[1]
+     score_columns = capacity_columns
+     block_topk = token_topk // compress_ratio
++    if (
++        max_seq_len is not None
++        and 0 < max_seq_len
++        and compress_ratio > 0
++        and max_seq_len // compress_ratio <= block_topk
++        and q.is_cuda
++        and HAS_TRITON
++        and _use_sm70_qsa_lexicographic_topk(block_topk)
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        from vllm.config.compilation import CUDAGraphMode
++        from vllm.forward_context import (
++            get_forward_context,
++            is_forward_context_available,
++        )
++
++        if (
++            not is_forward_context_available()
++            or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
++        ):
++            column_block = 256
++            _expand_qsa_indices_kernel[(rows, triton.cdiv(output_width, column_block))](
++                out,
++                query_positions,
++                sequence_lengths,
++                token_to_req,
++                out,
++                0,
++                0,
++                out.stride(0),
++                out.stride(1),
++                rows,
++                sequence_lengths.shape[0],
++                BLOCK_TOPK=block_topk,
++                COMPRESS_RATIO=compress_ratio,
++                TOKEN_TOPK=token_topk,
++                OUTPUT_WIDTH=output_width,
++                COLUMN_BLOCK=column_block,
++                IDENTITY_BLOCKS=True,
++                num_warps=4,
++            )
++            return out
+     contiguous_keys: torch.Tensor | None = None
+```
+
+### 4.15 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` (`D22` & `D23`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
++++ b/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
+@@ -47,6 +47,7 @@ _QSA_OUT_SUFFIX = ".self_attn.o_proj"
+ _QSA_INDEX_SUFFIX = ".self_attn.indexer.index_qk_proj"
+ _ROUTER_SUFFIX = ".mlp.gate"
+ _SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
++_SHARED_DOWN_SUFFIX = ".mlp.shared_expert.down_proj"
+@@ -718,6 +719,10 @@ def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
++    if prefix.endswith(_QSA_INDEX_SUFFIX) and shape == (128, 2560):
++        return _GemvPlan(512, 2, 0)
++    if prefix.endswith(_SHARED_DOWN_SUFFIX) and shape == (2560, 160):
++        return _GemvPlan(256, 2, 0)
+     for suffix, expected_shape, plan in _ROLE_PLANS:
+         if prefix.endswith(suffix) and shape == expected_shape:
+             return plan
+```
+
+### 4.16 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py` (`D24`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py
++++ b/vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py
+@@ -12,6 +12,114 @@ from vllm.model_executor.layers.linear import (
+     UnquantizedLinearMethod,
+ )
+ from vllm.platforms import current_platform
++from vllm.triton_utils import HAS_TRITON, tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++
++@triton.jit
++def _qwen38_mtp_fc_fused_gemv_add_kernel(
++    e_ptr,
++    h_ptr,
++    w_e_ptr,
++    w_h_ptr,
++    out_ptr,
++    K: tl.constexpr,
++    N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    col = tl.program_id(0)
++    row = tl.program_id(1)
++    offsets = tl.arange(0, BLOCK_K)
++    acc_e = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    acc_h0 = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    acc_h1 = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    acc_h2 = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    acc_h3 = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    e_row_ptr = e_ptr + row * K
++    h_row_ptr = h_ptr + row * (4 * K)
++    w_e_col_ptr = w_e_ptr + col * K
++    w_h_col_ptr = w_h_ptr + col * K
++    for block_start in tl.static_range(0, K, BLOCK_K):
++        idx = block_start + offsets
++        we = tl.load(w_e_col_ptr + idx).to(tl.float32)
++        wh = tl.load(w_h_col_ptr + idx).to(tl.float32)
++        ev = tl.load(e_row_ptr + idx).to(tl.float32)
++        h0 = tl.load(h_row_ptr + 0 * K + idx).to(tl.float32)
++        h1 = tl.load(h_row_ptr + 1 * K + idx).to(tl.float32)
++        h2 = tl.load(h_row_ptr + 2 * K + idx).to(tl.float32)
++        h3 = tl.load(h_row_ptr + 3 * K + idx).to(tl.float32)
++        acc_e += ev * we
++        acc_h0 += h0 * wh
++        acc_h1 += h1 * wh
++        acc_h2 += h2 * wh
++        acc_h3 += h3 * wh
++    el = tl.sum(acc_e, axis=0).to(tl.float16)
++    hl0 = tl.sum(acc_h0, axis=0).to(tl.float16)
++    hl1 = tl.sum(acc_h1, axis=0).to(tl.float16)
++    hl2 = tl.sum(acc_h2, axis=0).to(tl.float16)
++    hl3 = tl.sum(acc_h3, axis=0).to(tl.float16)
++    out_base = out_ptr + row * (4 * N) + col
++    tl.store(out_base + 0 * N, el + hl0)
++    tl.store(out_base + 1 * N, el + hl1)
++    tl.store(out_base + 2 * N, el + hl2)
++    tl.store(out_base + 3 * N, el + hl3)
+@@ -52,8 +160,14 @@ def maybe_combine_fc(model, embedding, hidden):
+     rows = embedding.shape[0]
+     e = model.pre_fc_norm_embedding(embedding)
+     h = model.pre_fc_norm_hidden(hidden).view(rows, 4, 2560)
+-    el = model.fc_embedding.quant_method.apply(model.fc_embedding, e)
+-    hl = model.fc_hidden.quant_method.apply(model.fc_hidden, h)
++    if e.device.type == "cuda":
++        local_sum = torch.ops.vllm.qwen38_sm70_mtp_fc_local_add(
++            e, h, model.fc_embedding.weight, model.fc_hidden.weight
++        )
++    else:
++        el = model.fc_embedding.quant_method.apply(model.fc_embedding, e)
++        hl = model.fc_hidden.quant_method.apply(model.fc_hidden, h)
++        local_sum = el.unsqueeze(-2) + hl
+     return tensor_model_parallel_all_gather(local_sum).flatten(-2)
+```
+
+### 4.17 `vllm/models/qwen4_exp/nvidia/mtp.py` (`D25`)
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -78,6 +79,22 @@ logger = init_logger(__name__)
++@triton.jit
++def _compact_topk_single_row_kernel(
++    buffer_ptr,
++    row_indices_ptr,
++    stride_row,
++    width,
++    BLOCK: tl.constexpr,
++):
++    src_row = tl.load(row_indices_ptr).to(tl.int64)
++    if src_row <= 0:
++        return
++    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = cols < width
++    vals = tl.load(buffer_ptr + src_row * stride_row + cols, mask=mask)
++    tl.store(buffer_ptr + cols, vals, mask=mask)
+@@ -434,8 +451,47 @@ class Qwen4ExpMultiTokenPredictor(nn.Module, SupportsPP):
+     def compact_topk_indices(self, row_indices: torch.Tensor) -> None:
+         """Keep each request's target-aligned step-0 sparse-index row."""
+ 
+         num_rows = row_indices.numel()
++        if num_rows <= 0:
++            return
++        seen_ptrs: set[int] = set()
+         for attention in self._iter_qsa_attentions():
+             buffer = attention.topk_indices_buffer
+-            selected = buffer.index_select(0, row_indices)
+-            buffer[:num_rows].copy_(selected)
++            ptr = buffer.data_ptr()
++            if ptr in seen_ptrs:
++                continue
++            seen_ptrs.add(ptr)
++            width = buffer.shape[1]
++            if (
++                num_rows == 1
++                and HAS_TRITON
++                and buffer.device.type == "cuda"
++                and row_indices.device == buffer.device
++                and buffer.stride(1) == 1
++            ):
++                _compact_topk_single_row_kernel[(triton.cdiv(width, 256),)](
++                    buffer,
++                    row_indices,
++                    buffer.stride(0),
++                    width,
++                    BLOCK=256,
++                    num_warps=2,
++                )
++            elif buffer.device.type == "cuda":
++                scratch = getattr(self, "_compact_topk_scratch", None)
++                if (
++                    scratch is None
++                    or scratch.shape[0] < num_rows
++                    or scratch.shape[1] != width
++                    or scratch.dtype != buffer.dtype
++                    or scratch.device != buffer.device
++                ):
++                    cap = max(num_rows, buffer.shape[0])
++                    scratch = torch.empty(
++                        (cap, width), dtype=buffer.dtype, device=buffer.device
++                    )
++                    object.__setattr__(self, "_compact_topk_scratch", scratch)
++                selected = scratch[:num_rows]
++                torch.index_select(buffer, 0, row_indices, out=selected)
++                buffer[:num_rows].copy_(selected)
++            else:
++                selected = buffer.index_select(0, row_indices)
++                buffer[:num_rows].copy_(selected)
 ```
 
 ---

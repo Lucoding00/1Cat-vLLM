@@ -47,6 +47,7 @@ _QSA_OUT_SUFFIX = ".self_attn.o_proj"
 _QSA_INDEX_SUFFIX = ".self_attn.indexer.index_qk_proj"
 _ROUTER_SUFFIX = ".mlp.gate"
 _SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
+_SHARED_DOWN_SUFFIX = ".mlp.shared_expert.down_proj"
 
 # Plans are cold-cache CUDA Graph winners on real checkpoint weights. Keep the
 # role in the key: GDN and QSA can share a physical shape while remaining
@@ -718,6 +719,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
 
 def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
+    if prefix.endswith(_QSA_INDEX_SUFFIX) and shape == (128, 2560):
+        return _GemvPlan(512, 2, 0)
+    if prefix.endswith(_SHARED_DOWN_SUFFIX) and shape == (2560, 160):
+        return _GemvPlan(256, 2, 0)
     for suffix, expected_shape, plan in _ROLE_PLANS:
         if prefix.endswith(suffix) and shape == expected_shape:
             return plan

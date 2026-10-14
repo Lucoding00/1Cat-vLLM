@@ -242,7 +242,11 @@ class QSAIndexer(nn.Module):
                 return out
             return result
 
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.forward_context import is_forward_context_available
+
         from .ops.qsa import (
+            _use_sm70_qsa_lexicographic_topk,
             qsa_compress_groups_with_ratio,
             qsa_select_paged_tokens,
             qsa_store_cache_rows,
@@ -253,27 +257,84 @@ class QSAIndexer(nn.Module):
         hidden_states = hidden_states[:num_tokens]
         positions = positions[..., :num_tokens]
 
-        # Q/K projection
-        if hidden_states.shape[-1] != self.index_qk_proj.input_size:
-            # Already projected inside the fused SM70 qkv launch.
-            projected_qk = hidden_states
-        else:
-            projected_qk, _ = self.index_qk_proj(hidden_states)
-        projected_q, raw_keys = projected_qk.split(
-            (
-                self.index_n_heads * self.index_head_dim,
-                self.index_kv_heads * self.index_head_dim,
-            ),
-            dim=-1,
+        q_dim = self.index_n_heads * self.index_head_dim
+        k_dim = self.index_kv_heads * self.index_head_dim
+        block_topk = self.token_topk // self.compress_ratio
+        max_seq_len = getattr(compressed_metadata, "max_seq_len", None)
+        all_blocks_fit = bool(
+            select
+            and not self.skip_topk
+            and self.use_fused_pre_indexer
+            and hidden_states.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+            and (
+                not is_forward_context_available()
+                or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+            )
+            and max_seq_len is not None
+            and 0 < max_seq_len
+            and max_seq_len // self.compress_ratio <= block_topk
+            and _use_sm70_qsa_lexicographic_topk(block_topk)
         )
+        skip_query_prep = self.skip_topk or not select or all_blocks_fit
+
+        # Q/K projection
+        if hidden_states.shape[-1] == k_dim:
+            projected_q = None
+            raw_keys = hidden_states
+        elif hidden_states.shape[-1] != self.index_qk_proj.input_size:
+            # Already projected inside the fused SM70 qkv launch.
+            projected_q, raw_keys = hidden_states.split((q_dim, k_dim), dim=-1)
+        else:
+            weight = getattr(self.index_qk_proj, "weight", None)
+            if (
+                skip_query_prep
+                and self.use_fused_pre_indexer
+                and isinstance(weight, torch.Tensor)
+                and weight.shape == (q_dim + k_dim, hidden_states.shape[-1])
+                and weight.dtype in (torch.float16, torch.bfloat16)
+                and getattr(self.index_qk_proj, "bias", None) is None
+                and not getattr(
+                    self.index_qk_proj, "_sm70_qwen4_exp_online_qpn8", False
+                )
+            ):
+                from vllm.config.execution_policy import (
+                    use_sm70_decode_graph_semantics,
+                )
+
+                from .sm70_fp16_gemv import Qwen38SM70FP16LinearMethod
+
+                k_weight = weight[q_dim:]
+                projected_q = None
+                if (
+                    isinstance(
+                        getattr(self.index_qk_proj, "quant_method", None),
+                        Qwen38SM70FP16LinearMethod,
+                    )
+                    and use_sm70_decode_graph_semantics()
+                ):
+                    raw_keys = torch.ops.vllm.qwen38_sm70_fp16_gemv(
+                        hidden_states,
+                        k_weight,
+                        getattr(self.index_qk_proj, "prefix", ""),
+                        None,
+                        False,
+                    )
+                else:
+                    raw_keys = torch.nn.functional.linear(hidden_states, k_weight)
+            else:
+                projected_qk, _ = self.index_qk_proj(hidden_states)
+                projected_q, raw_keys = projected_qk.split((q_dim, k_dim), dim=-1)
         raw_key_state_cache = self.raw_key_cache
         compressed_key_cache = self.compressed_key_cache.kv_cache
-        skip_query_prep = self.skip_topk or not select
 
         if self.use_fused_pre_indexer:
-            q = self._get_q_buffer(num_tokens, projected_q.dtype, projected_q.device)
+            q = self._get_q_buffer(num_tokens, raw_keys.dtype, raw_keys.device)
+            q_input = (
+                q.view(num_tokens, q_dim) if projected_q is None else projected_q
+            )
             qsa_pre_indexer(
-                projected_q,
+                q_input,
                 raw_keys,
                 positions,
                 self.rotary_emb.cos_sin_cache,

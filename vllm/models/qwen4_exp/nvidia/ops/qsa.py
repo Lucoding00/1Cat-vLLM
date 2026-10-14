@@ -391,6 +391,7 @@ def _expand_qsa_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    IDENTITY_BLOCKS: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -417,11 +418,16 @@ def _expand_qsa_indices_kernel(
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
-    block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
-        mask=(row < rows) & is_expanded,
-        other=-1,
-    )
+    if IDENTITY_BLOCKS:
+        block = safe_rank
+    else:
+        block = tl.load(
+            block_indices_ptr
+            + row * stride_blocks_row
+            + safe_rank * stride_blocks_column,
+            mask=(row < rows) & is_expanded,
+            other=-1,
+        )
     expanded = block * COMPRESS_RATIO + offset
     tail_offset = columns - expanded_count
     is_tail = (
@@ -1783,6 +1789,48 @@ def qsa_select_paged_tokens(
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
     score_columns = capacity_columns
     block_topk = token_topk // compress_ratio
+    if (
+        max_seq_len is not None
+        and 0 < max_seq_len
+        and compress_ratio > 0
+        and max_seq_len // compress_ratio <= block_topk
+        and q.is_cuda
+        and HAS_TRITON
+        and _use_sm70_qsa_lexicographic_topk(block_topk)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if (
+            not is_forward_context_available()
+            or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            column_block = 256
+            _expand_qsa_indices_kernel[(rows, triton.cdiv(output_width, column_block))](
+                out,
+                query_positions,
+                sequence_lengths,
+                token_to_req,
+                out,
+                0,
+                0,
+                out.stride(0),
+                out.stride(1),
+                rows,
+                sequence_lengths.shape[0],
+                BLOCK_TOPK=block_topk,
+                COMPRESS_RATIO=compress_ratio,
+                TOKEN_TOPK=token_topk,
+                OUTPUT_WIDTH=output_width,
+                COLUMN_BLOCK=column_block,
+                IDENTITY_BLOCKS=True,
+                num_warps=4,
+            )
+            return out
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
