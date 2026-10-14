@@ -530,9 +530,24 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices.shape[1],
         )
         resolve_physical = bool(key_cache.shape[0] * key_cache.shape[1] < 2**31)
+        rows = query.shape[0]
+        counts_buf = getattr(self, "_dcp_valid_counts_buffer", None)
+        if (
+            counts_buf is None
+            or counts_buf.numel() < rows
+            or counts_buf.device != logical_indices.device
+        ):
+            cap = 1 << (max(rows, 1) - 1).bit_length()
+            if counts_buf is not None and counts_buf.device == logical_indices.device:
+                cap = max(cap, counts_buf.numel())
+            counts_buf = torch.empty(
+                (cap,), dtype=torch.int32, device=logical_indices.device
+            )
+            self._dcp_valid_counts_buffer = counts_buf
+        local_valid_counts = counts_buf[:rows]
         local_indices = qsa_localize_dcp_indices(
             logical_indices,
-            local_indices_buffer[: query.shape[0], :local_width],
+            local_indices_buffer[:rows, :local_width],
             dcp_world_size=self.dcp_world_size,
             dcp_rank=self.dcp_rank,
             interleave_size=layer.cp_kv_cache_interleave_size,
@@ -540,9 +555,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             block_table=block_table if resolve_physical else None,
             token_to_req=token_to_req if resolve_physical else None,
             num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
+            valid_counts=local_valid_counts,
         )
-        partial_output = partial_output_buffer[: query.shape[0]]
-        partial_lse = partial_lse_buffer[: query.shape[0]]
+        partial_output = partial_output_buffer[:rows]
+        partial_lse = partial_lse_buffer[:rows]
         use_fused_a2a_pack = bool(
             self.dcp_combine is dcp_a2a_lse_reduce
             and self.dcp_world_size > 1
@@ -554,7 +570,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
                 (
                     self.dcp_world_size,
-                    query.shape[0],
+                    rows,
                     query.shape[1],
                     query.shape[2] + 1,
                 ),
@@ -578,6 +594,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             lse=partial_lse,
             pre_resolved_indices=resolve_physical,
             dcp_packed_out=send_buffer,
+            valid_counts=local_valid_counts,
         )
         gate_view = output_gate.view_as(output)
         if self.dcp_combine is dcp_a2a_lse_reduce:
@@ -1233,7 +1250,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
-        if self._sm70_qsa_prep and num_tokens <= 32:
+        if self._sm70_qsa_prep and num_tokens >= 1:
             # Raw rows go to the attention op, which normalizes, rotates and
             # caches them in one launch; the gate stays strided in q_gate.
             q_gate = qkv[:, : self.q_size * 2].view(

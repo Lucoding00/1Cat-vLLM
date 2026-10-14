@@ -331,47 +331,83 @@ def _qwen38_ple_m1_short_conv_kernel(
     state_base = safe_state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
     state_mask = hidden_mask & use_initial
 
-    s0 = tl.load(state_ptr + state_base, mask=state_mask, other=0.0).to(tl.float32)
-    s1 = tl.load(
-        state_ptr + state_base + STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s2 = tl.load(
-        state_ptr + state_base + 2 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s3 = tl.load(
-        state_ptr + state_base + 3 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s4 = tl.load(
-        state_ptr + state_base + 4 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s5 = tl.load(
-        state_ptr + state_base + 5 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s6 = tl.load(
-        state_ptr + state_base + 6 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s7 = tl.load(
-        state_ptr + state_base + 7 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
-    s8 = tl.load(
-        state_ptr + state_base + 8 * STATE_STRIDE_2,
-        mask=state_mask,
-        other=0.0,
-    ).to(tl.float32)
+    s0 = (
+        tl.load(state_ptr + state_base, mask=state_mask, other=0.0)
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s1 = (
+        tl.load(
+            state_ptr + state_base + STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s2 = (
+        tl.load(
+            state_ptr + state_base + 2 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s3 = (
+        tl.load(
+            state_ptr + state_base + 3 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s4 = (
+        tl.load(
+            state_ptr + state_base + 4 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s5 = (
+        tl.load(
+            state_ptr + state_base + 5 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s6 = (
+        tl.load(
+            state_ptr + state_base + 6 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s7 = (
+        tl.load(
+            state_ptr + state_base + 7 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    s8 = (
+        tl.load(
+            state_ptr + state_base + 8 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
     row_offset = row * HIDDEN_SIZE + hidden
     x = tl.load(x_ptr + row_offset, mask=hidden_mask, other=0.0).to(tl.float32)
     w0 = tl.load(weight_ptr + hidden * 4).to(tl.float32)
@@ -402,6 +438,524 @@ def _qwen38_ple_m1_short_conv_kernel(
     tl.store(state_ptr + state_base + 6 * STATE_STRIDE_2, s7, mask=update_mask)
     tl.store(state_ptr + state_base + 7 * STATE_STRIDE_2, s8, mask=update_mask)
     tl.store(state_ptr + state_base + 8 * STATE_STRIDE_2, x, mask=update_mask)
+
+
+@triton.jit
+def _qwen38_ple_prefill_short_conv_kernel(
+    x_ptr,
+    state_ptr,
+    weight_ptr,
+    output_ptr,
+    q_starts_ptr,
+    state_index_ptr,
+    has_initial_ptr,
+    STATE_STRIDE_0: tl.constexpr,
+    STATE_STRIDE_1: tl.constexpr,
+    STATE_STRIDE_2: tl.constexpr,
+    NUM_REQS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Row-major 4-tap dilated short-conv for Qwen3.8 prefill without transpose."""
+
+    hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = tl.program_id(1).to(tl.int64)
+    hidden_mask = hidden < HIDDEN_SIZE
+
+    if NUM_REQS == 1:
+        req = tl.zeros([], dtype=tl.int64)
+        req_start = tl.zeros([], dtype=tl.int64)
+    else:
+        req_offsets = tl.arange(0, BLOCK_R)
+        starts = tl.load(
+            q_starts_ptr + req_offsets,
+            mask=req_offsets <= NUM_REQS,
+            other=0x7FFFFFFF,
+        ).to(tl.int64)
+        req = tl.minimum(
+            tl.sum((starts <= row).to(tl.int32), axis=0) - 1,
+            NUM_REQS - 1,
+        ).to(tl.int64)
+        req_start = tl.load(q_starts_ptr + req).to(tl.int64)
+
+    col = row - req_start
+    state_index = tl.load(state_index_ptr + req).to(tl.int64)
+    valid = state_index != NULL_STATE_ID
+    safe_state_index = tl.where(valid, state_index, 0)
+    use_initial = valid & (tl.load(has_initial_ptr + req).to(tl.int32) != 0)
+    state_base = safe_state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
+
+    hist0 = col
+    t0_from_x = hist0 >= 9
+    t0_x = tl.load(
+        x_ptr + (req_start + tl.maximum(col - 9, 0)) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & t0_from_x,
+        other=0.0,
+    ).to(tl.float32)
+    t0_s = (
+        tl.load(
+            state_ptr + state_base + tl.minimum(hist0, 8) * STATE_STRIDE_2,
+            mask=hidden_mask & (~t0_from_x) & use_initial,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    t0 = tl.where(t0_from_x, t0_x, t0_s)
+
+    hist1 = col + 3
+    t1_from_x = hist1 >= 9
+    t1_x = tl.load(
+        x_ptr + (req_start + tl.maximum(col - 6, 0)) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & t1_from_x,
+        other=0.0,
+    ).to(tl.float32)
+    t1_s = (
+        tl.load(
+            state_ptr + state_base + tl.minimum(hist1, 8) * STATE_STRIDE_2,
+            mask=hidden_mask & (~t1_from_x) & use_initial,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    t1 = tl.where(t1_from_x, t1_x, t1_s)
+
+    hist2 = col + 6
+    t2_from_x = hist2 >= 9
+    t2_x = tl.load(
+        x_ptr + (req_start + tl.maximum(col - 3, 0)) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & t2_from_x,
+        other=0.0,
+    ).to(tl.float32)
+    t2_s = (
+        tl.load(
+            state_ptr + state_base + tl.minimum(hist2, 8) * STATE_STRIDE_2,
+            mask=hidden_mask & (~t2_from_x) & use_initial,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    t2 = tl.where(t2_from_x, t2_x, t2_s)
+
+    t3 = tl.load(
+        x_ptr + row * HIDDEN_SIZE + hidden,
+        mask=hidden_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    w0 = tl.load(weight_ptr + hidden * 4, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w1 = tl.load(weight_ptr + hidden * 4 + 1, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w2 = tl.load(weight_ptr + hidden * 4 + 2, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w3 = tl.load(weight_ptr + hidden * 4 + 3, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    conv = t0 * w0
+    conv += t1 * w1
+    conv += t2 * w2
+    conv += t3 * w3
+    conv = conv.to(tl.float16)
+    tl.store(
+        output_ptr + row * HIDDEN_SIZE + hidden,
+        tl.where(valid, conv, 0.0),
+        mask=hidden_mask,
+    )
+
+
+@triton.jit
+def _qwen38_ple_prefill_state_update_kernel(
+    x_ptr,
+    state_ptr,
+    q_starts_ptr,
+    state_index_ptr,
+    has_initial_ptr,
+    STATE_STRIDE_0: tl.constexpr,
+    STATE_STRIDE_1: tl.constexpr,
+    STATE_STRIDE_2: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Commit the trailing 9 tokens per prefill request into conv_state."""
+
+    hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.program_id(1).to(tl.int64)
+    hidden_mask = hidden < HIDDEN_SIZE
+
+    req_start = tl.load(q_starts_ptr + req).to(tl.int64)
+    req_end = tl.load(q_starts_ptr + req + 1).to(tl.int64)
+    length = req_end - req_start
+    state_index = tl.load(state_index_ptr + req).to(tl.int64)
+    valid = (state_index != NULL_STATE_ID) & (length > 0)
+    if not valid:
+        return
+    use_initial = tl.load(has_initial_ptr + req).to(tl.int32) != 0
+    state_base = state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
+    state_mask = hidden_mask & use_initial
+
+    s0 = tl.load(state_ptr + state_base, mask=state_mask, other=0.0).to(tl.float16)
+    s1 = tl.load(
+        state_ptr + state_base + STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s2 = tl.load(
+        state_ptr + state_base + 2 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s3 = tl.load(
+        state_ptr + state_base + 3 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s4 = tl.load(
+        state_ptr + state_base + 4 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s5 = tl.load(
+        state_ptr + state_base + 5 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s6 = tl.load(
+        state_ptr + state_base + 6 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s7 = tl.load(
+        state_ptr + state_base + 7 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+    s8 = tl.load(
+        state_ptr + state_base + 8 * STATE_STRIDE_2, mask=state_mask, other=0.0
+    ).to(tl.float16)
+
+    for idx in tl.static_range(9):
+        hist_pos = length + idx
+        from_x = hist_pos >= 9
+        x_val = tl.load(
+            x_ptr
+            + (req_start + tl.maximum(hist_pos - 9, 0)) * HIDDEN_SIZE
+            + hidden,
+            mask=hidden_mask & from_x,
+            other=0.0,
+        ).to(tl.float16)
+        s_val = tl.where(
+            hist_pos == 0,
+            s0,
+            tl.where(
+                hist_pos == 1,
+                s1,
+                tl.where(
+                    hist_pos == 2,
+                    s2,
+                    tl.where(
+                        hist_pos == 3,
+                        s3,
+                        tl.where(
+                            hist_pos == 4,
+                            s4,
+                            tl.where(
+                                hist_pos == 5,
+                                s5,
+                                tl.where(
+                                    hist_pos == 6,
+                                    s6,
+                                    tl.where(hist_pos == 7, s7, s8),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        next_val = tl.where(from_x, x_val, s_val)
+        tl.store(
+            state_ptr + state_base + idx * STATE_STRIDE_2,
+            next_val,
+            mask=hidden_mask,
+        )
+
+
+@triton.jit
+def _qwen38_ple_spec_short_conv_kernel(
+    x_ptr,
+    state_ptr,
+    weight_ptr,
+    output_ptr,
+    state_index_ptr,
+    q_starts_ptr,
+    accepted_ptr,
+    ROWS,
+     NUM_REQS: tl.constexpr,
+    STATE_STRIDE_0: tl.constexpr,
+    STATE_STRIDE_1: tl.constexpr,
+    STATE_STRIDE_2: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fused multi-request MTP4 PLE rollback + 4-tap conv + state commit."""
+
+    hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.program_id(1).to(tl.int64)
+    hidden_mask = hidden < HIDDEN_SIZE
+
+    sid = tl.load(state_index_ptr + req).to(tl.int64)
+    valid_state = sid != NULL_STATE_ID
+    safe_sid = tl.where(valid_state, sid, 0)
+    start = tl.maximum(0, tl.load(q_starts_ptr + req).to(tl.int64))
+    end = tl.maximum(start, tl.load(q_starts_ptr + req + 1).to(tl.int64))
+    count = tl.minimum(5, end - start)
+    accepted = tl.load(accepted_ptr + req).to(tl.int64)
+    rollback = tl.where(valid_state, tl.maximum(0, tl.minimum(4, accepted - 1)), 0)
+    state_base = (
+        safe_sid * STATE_STRIDE_0
+        + hidden * STATE_STRIDE_1
+        + rollback * STATE_STRIDE_2
+    )
+    state_mask = hidden_mask & valid_state
+
+    h0 = (
+        tl.load(state_ptr + state_base, mask=state_mask, other=0.0)
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h1 = (
+        tl.load(
+            state_ptr + state_base + STATE_STRIDE_2, mask=state_mask, other=0.0
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h2 = (
+        tl.load(
+            state_ptr + state_base + 2 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h3 = (
+        tl.load(
+            state_ptr + state_base + 3 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h4 = (
+        tl.load(
+            state_ptr + state_base + 4 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h5 = (
+        tl.load(
+            state_ptr + state_base + 5 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h6 = (
+        tl.load(
+            state_ptr + state_base + 6 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h7 = (
+        tl.load(
+            state_ptr + state_base + 7 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+    h8 = (
+        tl.load(
+            state_ptr + state_base + 8 * STATE_STRIDE_2,
+            mask=state_mask,
+            other=0.0,
+        )
+        .to(tl.float16)
+        .to(tl.float32)
+    )
+
+    h9 = tl.load(
+        x_ptr + start * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & (0 < count) & (start < ROWS),
+        other=0.0,
+    ).to(tl.float32)
+    h10 = tl.load(
+        x_ptr + (start + 1) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & (1 < count) & (start + 1 < ROWS),
+        other=0.0,
+    ).to(tl.float32)
+    h11 = tl.load(
+        x_ptr + (start + 2) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & (2 < count) & (start + 2 < ROWS),
+        other=0.0,
+    ).to(tl.float32)
+    h12 = tl.load(
+        x_ptr + (start + 3) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & (3 < count) & (start + 3 < ROWS),
+        other=0.0,
+    ).to(tl.float32)
+    h13 = tl.load(
+        x_ptr + (start + 4) * HIDDEN_SIZE + hidden,
+        mask=hidden_mask & (4 < count) & (start + 4 < ROWS),
+        other=0.0,
+    ).to(tl.float32)
+
+    w0 = tl.load(weight_ptr + hidden * 4, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w1 = tl.load(weight_ptr + hidden * 4 + 1, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w2 = tl.load(weight_ptr + hidden * 4 + 2, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    w3 = tl.load(weight_ptr + hidden * 4 + 3, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+
+    c0 = (h0 * w0 + h3 * w1 + h6 * w2 + h9 * w3).to(tl.float16)
+    c1 = (h1 * w0 + h4 * w1 + h7 * w2 + h10 * w3).to(tl.float16)
+    c2 = (h2 * w0 + h5 * w1 + h8 * w2 + h11 * w3).to(tl.float16)
+    c3 = (h3 * w0 + h6 * w1 + h9 * w2 + h12 * w3).to(tl.float16)
+    c4 = (h4 * w0 + h7 * w1 + h10 * w2 + h13 * w3).to(tl.float16)
+
+    tl.store(
+        output_ptr + start * HIDDEN_SIZE + hidden,
+        tl.where(0 < count, c0, 0.0),
+        mask=hidden_mask & (0 < end - start) & (start < ROWS),
+    )
+    tl.store(
+        output_ptr + (start + 1) * HIDDEN_SIZE + hidden,
+        tl.where(1 < count, c1, 0.0),
+        mask=hidden_mask & (1 < end - start) & (start + 1 < ROWS),
+    )
+    tl.store(
+        output_ptr + (start + 2) * HIDDEN_SIZE + hidden,
+        tl.where(2 < count, c2, 0.0),
+        mask=hidden_mask & (2 < end - start) & (start + 2 < ROWS),
+    )
+    tl.store(
+        output_ptr + (start + 3) * HIDDEN_SIZE + hidden,
+        tl.where(3 < count, c3, 0.0),
+        mask=hidden_mask & (3 < end - start) & (start + 3 < ROWS),
+    )
+    tl.store(
+        output_ptr + (start + 4) * HIDDEN_SIZE + hidden,
+        tl.where(4 < count, c4, 0.0),
+        mask=hidden_mask & (4 < end - start) & (start + 4 < ROWS),
+    )
+
+    r_pad = start + 5
+    r_pad_end = tl.minimum(end, ROWS)
+    while r_pad < r_pad_end:
+        tl.store(
+            output_ptr + r_pad * HIDDEN_SIZE + hidden,
+            0.0,
+            mask=hidden_mask,
+        )
+        r_pad += 1
+    if req == 0:
+        r_pre = tl.zeros([], dtype=tl.int64)
+        r_pre_end = tl.minimum(start, ROWS)
+        while r_pre < r_pre_end:
+            tl.store(
+                output_ptr + r_pre * HIDDEN_SIZE + hidden,
+                0.0,
+                mask=hidden_mask,
+            )
+            r_pre += 1
+    if req == NUM_REQS - 1:
+        r = end
+        while r < ROWS:
+            tl.store(
+                output_ptr + r * HIDDEN_SIZE + hidden,
+                0.0,
+                mask=hidden_mask,
+            )
+            r += 1
+
+    write_base = safe_sid * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
+    tl.store(
+        state_ptr + write_base,
+        h1.to(tl.float16),
+        mask=state_mask & (0 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + STATE_STRIDE_2,
+        h2.to(tl.float16),
+        mask=state_mask & (1 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 2 * STATE_STRIDE_2,
+        h3.to(tl.float16),
+        mask=state_mask & (2 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 3 * STATE_STRIDE_2,
+        h4.to(tl.float16),
+        mask=state_mask & (3 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 4 * STATE_STRIDE_2,
+        h5.to(tl.float16),
+        mask=state_mask & (4 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 5 * STATE_STRIDE_2,
+        h6.to(tl.float16),
+        mask=state_mask & (5 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 6 * STATE_STRIDE_2,
+        h7.to(tl.float16),
+        mask=state_mask & (6 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 7 * STATE_STRIDE_2,
+        h8.to(tl.float16),
+        mask=state_mask & (7 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 8 * STATE_STRIDE_2,
+        h9.to(tl.float16),
+        mask=state_mask & (8 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 9 * STATE_STRIDE_2,
+        h10.to(tl.float16),
+        mask=state_mask & (9 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 10 * STATE_STRIDE_2,
+        h11.to(tl.float16),
+        mask=state_mask & (10 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 11 * STATE_STRIDE_2,
+        h12.to(tl.float16),
+        mask=state_mask & (11 < 8 + count),
+    )
+    tl.store(
+        state_ptr + write_base + 12 * STATE_STRIDE_2,
+        h13.to(tl.float16),
+        mask=state_mask & (12 < 8 + count),
+    )
 
 
 def _splitmix64(value: int) -> int:
@@ -1535,8 +2089,35 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.ngram_heads_vocab_sizes,
                 self.ngram_heads_offsets,
             )
-            if reason is None:
-                logger.info_once("SM70 fused small-batch PLE ngram-ID path enabled.")
+            can_use_large_batch_ngram = (
+                reason == "outside_small_batch_band"
+                and num_tokens > 32
+                and 1 <= num_reqs <= 64
+                and ngram_context.ndim == 2
+                and ngram_context.shape[0] >= num_reqs
+                and ngram_context.shape[1] == 2
+                and (
+                    self.layer_multipliers.numel(),
+                    self.ngram_heads_vocab_sizes.numel(),
+                    self.ngram_heads_offsets.numel(),
+                )
+                == (3, 16, 16)
+                and all(
+                    tensor.device == input_ids.device
+                    and tensor.is_contiguous()
+                    and tensor.dtype in (torch.int32, torch.int64)
+                    for tensor in (
+                        input_ids,
+                        query_start_loc,
+                        ngram_context,
+                        self.layer_multipliers,
+                        self.ngram_heads_vocab_sizes,
+                        self.ngram_heads_offsets,
+                    )
+                )
+            )
+            if reason is None or can_use_large_batch_ngram:
+                logger.info_once("SM70 fused PLE ngram-ID path enabled.")
                 return sm70_ple_ngram_ids(
                     input_ids,
                     query_start_loc,
@@ -2240,7 +2821,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             and conv_state.ndim == 3
             and conv_state.shape[1] == 10240
             and conv_state.shape[2] >= 9
-            and conv_state.dtype == torch.float16
+            and conv_state.dtype in (torch.float16, torch.float32)
             and conv_state.is_cuda
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
@@ -2397,11 +2978,91 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
-        positions = torch.arange(
-            num_prefill_tokens, device=x_p.device, dtype=torch.int64
+        if (
+            current_platform.is_device_capability((7, 0))
+            and x_p.ndim == 2
+            and num_prefill_tokens >= 1
+            and x_p.shape[0] == num_prefill_tokens
+            and hidden_size == 10240
+            and x_p.dtype == torch.float16
+            and x_p.is_cuda
+            and x_p.is_contiguous()
+            and state_len == 9
+            and getattr(self, "short_conv_dilation", 3) == 3
+            and 1 <= num_prefills <= 64
+            and conv_state.ndim == 3
+            and conv_state.shape[0] > 0
+            and conv_state.shape[1] == 10240
+            and conv_state.shape[2] >= 9
+            and conv_state.dtype in (torch.float16, torch.float32)
+            and conv_state.is_cuda
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_cuda
+            and conv_weights.is_contiguous()
+            and query_start_loc_p.is_cuda
+            and state_indices_tensor_p.is_cuda
+            and has_initial_states_p.is_cuda
+            and x_p.device
+            == conv_state.device
+            == conv_weights.device
+            == query_start_loc_p.device
+            == state_indices_tensor_p.device
+            == has_initial_states_p.device
+        ):
+            q_starts_c = query_start_loc_p[: num_prefills + 1].contiguous()
+            state_indices_c = state_indices_tensor_p[:num_prefills].contiguous()
+            has_initial_c = has_initial_states_p[:num_prefills].contiguous()
+            conv_output = torch.empty_like(x_p)
+            grid_conv = (triton.cdiv(10240, 256), num_prefill_tokens)
+            _qwen38_ple_prefill_short_conv_kernel[grid_conv](
+                x_p,
+                conv_state,
+                conv_weights,
+                conv_output,
+                q_starts_c,
+                state_indices_c,
+                has_initial_c,
+                STATE_STRIDE_0=conv_state.stride(0),
+                STATE_STRIDE_1=conv_state.stride(1),
+                STATE_STRIDE_2=conv_state.stride(2),
+                NUM_REQS=num_prefills,
+                BLOCK_R=triton.next_power_of_2(num_prefills + 1),
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                HIDDEN_SIZE=10240,
+                BLOCK=256,
+                num_warps=4,
+            )
+            grid_state = (triton.cdiv(10240, 256), num_prefills)
+            _qwen38_ple_prefill_state_update_kernel[grid_state](
+                x_p,
+                conv_state,
+                q_starts_c,
+                state_indices_c,
+                has_initial_c,
+                STATE_STRIDE_0=conv_state.stride(0),
+                STATE_STRIDE_1=conv_state.stride(1),
+                STATE_STRIDE_2=conv_state.stride(2),
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                HIDDEN_SIZE=10240,
+                BLOCK=256,
+                num_warps=4,
+            )
+            F.silu(conv_output, inplace=True)
+            logger.info_once(
+                "SM70 Qwen3.8 fused prefill PLE short-conv path enabled."
+            )
+            return conv_output
+
+        single_prefill_fastpath = (
+            num_prefills == 1 and x_p.shape[0] == max_len == num_prefill_tokens
         )
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
-        col_indices = positions - q_starts[req_indices]
+        if not single_prefill_fastpath:
+            positions = torch.arange(
+                num_prefill_tokens, device=x_p.device, dtype=torch.int64
+            )
+            req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+            col_indices = positions - q_starts[req_indices]
 
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
@@ -2420,8 +3081,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # the profiling run never takes. Keep at most two alive: pack the
         # tokens straight into the channels-first history, take the next state
         # before the convolution, and free each buffer as soon as it is spent.
-        history = x_p.new_zeros((num_prefills, hidden_size, state_len + max_len))
-        history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p
+        if single_prefill_fastpath:
+            history = x_p.new_empty((1, hidden_size, state_len + max_len))
+            if state_len > 0 and conv_state.shape[0] <= 0:
+                history[..., :state_len].zero_()
+            history[..., state_len:] = x_p.transpose(0, 1).unsqueeze(0)
+        else:
+            history = x_p.new_zeros((num_prefills, hidden_size, state_len + max_len))
+            history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p
         next_state = None
         if state_len > 0 and conv_state.shape[0] > 0:
             state = conv_state.index_select(0, state_indices)[..., :state_len].to(
@@ -2457,7 +3124,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         conv_output.masked_fill_(
             ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1), 0
         )
-        output = conv_output.transpose(1, 2)[req_indices, col_indices]
+        if single_prefill_fastpath:
+            output = conv_output.squeeze(0).transpose(0, 1).contiguous()
+        else:
+            output = conv_output.transpose(1, 2)[req_indices, col_indices]
         del conv_output
 
         if next_state is not None:
@@ -2503,18 +3173,23 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         hidden_size = x_spec.size(-1)
         if (
             layer_policy().value("ple_spec_conv")
-            and num_reqs == 1
+            and 1 <= num_reqs <= 64
             and spec_query_len == 5
             and self.conv_state_len == 9
             and self.short_conv_dilation == 3
-            and x_spec.shape in ((5, 10240), (10, 10240))
+            and x_spec.ndim == 2
+            and x_spec.shape[0] >= 5
+            and x_spec.shape[1] == 10240
             and x_spec.is_cuda
             and x_spec.dtype == torch.float16
             and x_spec.is_contiguous()
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
             and conv_weights.is_contiguous()
-            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.ndim == 3
+            and conv_state.shape[0] > 0
+            and conv_state.shape[1] == 10240
+            and conv_state.shape[2] >= 13
             and conv_state.dtype in (torch.float16, torch.float32)
             and all(
                 t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
@@ -2527,16 +3202,45 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             and current_platform.is_device_capability((7, 0))
         ):
             output = torch.empty_like(x_spec)
-            torch.ops._C.qwen38_ple_spec_sm70_out(
-                output,
-                conv_state,
+            if hasattr(torch.ops._C, "qwen38_ple_spec_sm70_out") and (
+                num_reqs == 1 and x_spec.shape in ((5, 10240), (10, 10240))
+                and conv_state.shape[1:] == (10240, 13)
+            ):
+                torch.ops._C.qwen38_ple_spec_sm70_out(
+                    output,
+                    conv_state,
+                    x_spec,
+                    conv_weights,
+                    spec_state_indices_tensor,
+                    spec_query_start_loc,
+                    num_accepted_tokens,
+                )
+                logger.info_once(
+                    "SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled."
+                )
+                return output
+            _qwen38_ple_spec_short_conv_kernel[(triton.cdiv(10240, 256), num_reqs)](
                 x_spec,
+                conv_state,
                 conv_weights,
+                output,
                 spec_state_indices_tensor,
                 spec_query_start_loc,
                 num_accepted_tokens,
+                x_spec.shape[0],
+                NUM_REQS=num_reqs,
+                STATE_STRIDE_0=conv_state.stride(0),
+                STATE_STRIDE_1=conv_state.stride(1),
+                STATE_STRIDE_2=conv_state.stride(2),
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                HIDDEN_SIZE=10240,
+                BLOCK=256,
+                num_warps=4,
             )
-            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
+            F.silu(output, inplace=True)
+            logger.info_once(
+                "SM70 MTP4 multi-request PLE short-conv Triton fusion enabled."
+            )
             return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len

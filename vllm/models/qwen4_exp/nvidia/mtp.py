@@ -761,7 +761,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         # Finalize its calibrated k/v scales strictly from the checkpoint (no
         # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
         # and on the PLE offload process (is_offload_process()).
-        from .model import _finalize_qsa_e4m3_scale_load
+        from .model import (
+            _finalize_qsa_e4m3_scale_load,
+            _maybe_enable_sm70_peer_paths,
+        )
 
         _finalize_qsa_e4m3_scale_load(
             self,
@@ -769,6 +772,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self.model._kv_cache_dtype,
             require_calibrated_speculative_draft=True,
         )
+        _maybe_enable_sm70_peer_paths(self.vllm_config, self.model)
         return loaded_weights
 
 

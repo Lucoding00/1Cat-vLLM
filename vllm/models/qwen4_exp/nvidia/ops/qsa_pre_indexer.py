@@ -425,6 +425,7 @@ def qsa_pre_indexer(
     compress_ratio: int,
     mrope_section: tuple[int, int, int] | None,
     rope_pos_offset: int | None,
+    skip_q: bool = False,
 ) -> None:
     """Normalize Q, compress K, then update the circular raw state."""
     num_tokens = q.shape[0]
@@ -463,7 +464,13 @@ def qsa_pre_indexer(
     else:
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
-    num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+    num_q_work = (
+        0
+        if skip_q
+        else triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+    )
+    if num_k_work + num_q_work == 0:
+        return
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,
         q.stride(0),

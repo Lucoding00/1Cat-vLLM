@@ -268,6 +268,7 @@ class QSAIndexer(nn.Module):
         )
         raw_key_state_cache = self.raw_key_cache
         compressed_key_cache = self.compressed_key_cache.kv_cache
+        skip_query_prep = self.skip_topk or not select
 
         if self.use_fused_pre_indexer:
             q = self._get_q_buffer(num_tokens, projected_q.dtype, projected_q.device)
@@ -295,18 +296,20 @@ class QSAIndexer(nn.Module):
                     if raw_key_state_cache.rope_position_cache is not None
                     else None
                 ),
+                skip_q=skip_query_prep,
             )
         else:
             # Unfused reference path
             from flashinfer.norm import gemma_rmsnorm
 
-            q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
-                q.reshape(-1, self.index_head_dim),
-                self.q_layernorm.weight,
-                self.q_layernorm.variance_epsilon,
-            ).reshape_as(q)
-            q = apply_qsa_rope(self.rotary_emb, positions, q)
+            if not skip_query_prep:
+                q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
+                q = gemma_rmsnorm(
+                    q.reshape(-1, self.index_head_dim),
+                    self.q_layernorm.weight,
+                    self.q_layernorm.variance_epsilon,
+                ).reshape_as(q)
+                q = apply_qsa_rope(self.rotary_emb, positions, q)
 
             raw_key_cache = raw_key_state_cache.key_cache
             rope_position_cache = raw_key_state_cache.rope_position_cache

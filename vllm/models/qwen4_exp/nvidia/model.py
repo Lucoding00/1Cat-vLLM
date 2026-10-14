@@ -632,7 +632,12 @@ def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
     from vllm.model_executor.layers.quantization.sm70_dmv13_projection import attach
 
     fused = 0
-    for layer in model.layers:
+    layers_iter = (
+        model.layers.values()
+        if isinstance(model.layers, nn.ModuleDict)
+        else model.layers
+    )
+    for layer in layers_iter:
         if not isinstance(layer, Qwen4ExpDecoderLayer):
             continue
         if layer.layer_type == "linear_attention":

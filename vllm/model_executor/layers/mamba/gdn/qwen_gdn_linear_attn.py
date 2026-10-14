@@ -6003,6 +6003,46 @@ def qwen_gdn_input_projection(
     assert self.in_proj_ba is not None
     ba, _ = self.in_proj_ba(hidden_states)
 
+    from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+        _can_fuse_gdn_projection_split,
+        _qwen38_gdn_projection_split_kernel,
+    )
+
+    m = mixed_qkvz.shape[0]
+    if (
+        not self.gqa_interleaved_layout
+        and not self.disable_tp_for_ba_proj
+        and m > 1
+        and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
+        and self.value_dim // self.tp_size == 1536
+        and mixed_qkv_out.shape == (m, 2560)
+        and z_out.shape == (m, 12, 128)
+        and b_out.shape == (m, 12)
+        and a_out.shape == (m, 12)
+        and mixed_qkv_out.is_contiguous()
+        and z_out.is_contiguous()
+        and b_out.is_contiguous()
+        and a_out.is_contiguous()
+        and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
+    ):
+        _qwen38_gdn_projection_split_kernel[(m, 16)](
+            mixed_qkvz,
+            ba,
+            mixed_qkv_out,
+            z_out,
+            b_out,
+            a_out,
+            QKV=2560,
+            Z=1536,
+            B=12,
+            A=12,
+            BLOCK=256,
+            COPY_QKV=True,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
+
     if self.gqa_interleaved_layout:
         query, key, value, z, b, a = self.fix_query_key_value_ordering(
             mixed_qkvz,

@@ -644,6 +644,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HOST_INDICES=None,
     HOST_VALID_COUNTS=None,
     HOST_CACHE: tl.constexpr = False,
+    USE_VALID_COUNTS: tl.constexpr = False,
     HISTORY_SCALES=None,
     HISTORY_POSITIONS=None,
     HISTORY_LENGTHS=None,
@@ -686,7 +687,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
     loop_start = split_tile_start
     loop_end = split_tile_end
-    if HOST_CACHE:
+    if HOST_CACHE or USE_VALID_COUNTS:
         selected_count = tl.load(HOST_VALID_COUNTS + row)
         # The selector compacts the open group's causal tail immediately after
         # the selected complete blocks, including at attention tile boundaries.
@@ -2585,6 +2586,7 @@ def qsa_sparse_paged_attention(
     lse: torch.Tensor | None = None,
     pre_resolved_indices: bool = False,
     dcp_packed_out: torch.Tensor | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2759,6 +2761,14 @@ def qsa_sparse_paged_attention(
         # allocations per step across the 12 target QSA layers on TP4+DCP2.
         partial_output, partial_lse = _qsa_splitk_workspace(q, num_splits)
 
+    use_valid_counts = bool(
+        valid_counts is not None
+        and valid_counts.ndim == 1
+        and valid_counts.shape[0] >= q.shape[0]
+        and valid_counts.dtype == torch.int32
+        and valid_counts.device == q.device
+        and valid_counts.is_contiguous()
+    )
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
@@ -2803,6 +2813,8 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        HOST_VALID_COUNTS=valid_counts if use_valid_counts else None,
+        USE_VALID_COUNTS=use_valid_counts,
         dcp_packed_ptr=dcp_packed_out,
         H_PER_RANK=dcp_h_per_rank,
         num_warps=partial_warps,

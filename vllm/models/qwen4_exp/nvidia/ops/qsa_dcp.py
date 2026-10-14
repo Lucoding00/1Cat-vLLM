@@ -33,6 +33,8 @@ def _localize_indices(
     PAGE_SIZE: tl.constexpr = 1,
     PAGE_TABLE_WIDTH: tl.constexpr = 1,
     RESOLVE_PHYSICAL: tl.constexpr = False,
+    counts_ptr=None,
+    WRITE_COUNTS: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
@@ -64,6 +66,8 @@ def _localize_indices(
         local = tl.where(valid_phys, physical_page * PAGE_SIZE + page_offset, -1)
     position = tl.cumsum(owned.to(tl.int32), 0) - 1
     count = tl.sum(owned.to(tl.int32), 0)
+    if WRITE_COUNTS:
+        tl.store(counts_ptr + row, tl.minimum(count, OUT_WIDTH))
     # Disjoint writes avoid races between warp-local compaction and padding.
     tl.store(dst + row * dst_stride + col, -1, (col < OUT_WIDTH) & (col >= count))
     tl.store(
@@ -108,6 +112,7 @@ def qsa_localize_dcp_indices(
     block_table: torch.Tensor | None = None,
     token_to_req: torch.Tensor | None = None,
     num_cache_blocks: int | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compact this rank's selected IDs into an independent persistent buffer.
 
@@ -142,11 +147,15 @@ def qsa_localize_dcp_indices(
     ):
         raise ValueError("QSA DCP interleave must divide the positive local block size")
     if indices.numel() == 0:
+        if valid_counts is not None:
+            valid_counts.zero_()
         return out
     if indices.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
         raise ValueError("QSA DCP output must not alias the MTP selection buffer")
     if dcp_world_size == 1:
         out.copy_(indices[:, : out.shape[1]])
+        if valid_counts is not None:
+            valid_counts.copy_((out >= 0).sum(dim=1, dtype=torch.int32))
         return out
     if not indices.is_cuda:
         raise ValueError("QSA DCP localization requires CUDA buffers")
@@ -154,6 +163,14 @@ def qsa_localize_dcp_indices(
         block_table is not None
         and token_to_req is not None
         and num_cache_blocks is not None
+    )
+    write_counts = bool(
+        valid_counts is not None
+        and valid_counts.ndim == 1
+        and valid_counts.shape[0] >= indices.shape[0]
+        and valid_counts.dtype == torch.int32
+        and valid_counts.device == indices.device
+        and valid_counts.is_contiguous()
     )
     _localize_indices[(indices.shape[0],)](
         indices,
@@ -174,5 +191,7 @@ def qsa_localize_dcp_indices(
         PAGE_SIZE=local_block_size,
         PAGE_TABLE_WIDTH=block_table.shape[1] if block_table is not None else 1,
         RESOLVE_PHYSICAL=resolve_physical,
+        counts_ptr=valid_counts,
+        WRITE_COUNTS=write_counts,
     )
     return out

@@ -1167,6 +1167,8 @@ class SpecDecodeBaseProposer:
             pre_forward_stream_wait_ms = (time.perf_counter() - sync_t0) * 1000.0
         forward_enqueue_t0 = time.perf_counter() if ddtree_worker_profile else 0.0
         first_forward_start = self._step_profiler.start(profile_events)
+        if getattr(self, "share_mtp_topk_indices", False):
+            self.model.model.set_skip_topk(False)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -1419,102 +1421,119 @@ class SpecDecodeBaseProposer:
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
-        for token_index in range(self.num_speculative_tokens - 1):
-            spec_step_idx = token_index + 1
-            loop_cpu_start = time.perf_counter() if profile_events is not None else 0.0
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
-
-            if not self.constant_draft_positions:
-                positions = self._update_positions_dependent_metadata(
-                    positions,
-                    common_attn_metadata,
-                    batch_size,
-                    input_batch_size,
-                    block_size,
+        share_mtp_topk_indices = bool(
+            getattr(self, "share_mtp_topk_indices", False)
+            and self.num_speculative_tokens > 1
+        )
+        if share_mtp_topk_indices:
+            self.model.model.compact_topk_indices(token_indices_to_sample[:batch_size])
+            self.model.model.set_skip_topk(True)
+        try:
+            for token_index in range(self.num_speculative_tokens - 1):
+                spec_step_idx = token_index + 1
+                loop_cpu_start = (
+                    time.perf_counter() if profile_events is not None else 0.0
                 )
+                # Update the inputs.
+                # cast to int32 is crucial when eagle model is compiled.
+                # tensor.argmax() returns int64 by default.
+                input_ids = draft_token_ids_list[-1].int()
 
-            # Rebuild attention metadata. When draft positions are constant
-            # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
-            # loop iterations so we build once and reuse.
-            if not self.constant_draft_positions or token_index == 0:
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=spec_step_idx
+                if not self.constant_draft_positions:
+                    positions = self._update_positions_dependent_metadata(
+                        positions,
+                        common_attn_metadata,
+                        batch_size,
+                        input_batch_size,
+                        block_size,
                     )
-                )
 
-            # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
-            if self.supports_mm_inputs:
-                self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
+                # Rebuild attention metadata. When draft positions are constant
+                # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
+                # loop iterations so we build once and reuse.
+                if not self.constant_draft_positions or token_index == 0:
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata, draft_index=spec_step_idx
+                        )
+                    )
 
-                input_ids = None
-                inputs_embeds = self.inputs_embeds[:input_batch_size]
-            else:
-                input_ids = self.input_ids[:input_batch_size]
-                inputs_embeds = None
+                # copy inputs to buffer for cudagraph
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
+                if self.supports_mm_inputs:
+                    self.inputs_embeds[:batch_size] = self.model.embed_input_ids(
+                        input_ids
+                    )
 
-            # Run the model.
-            model_kwargs = {
-                "input_ids": input_ids,
-                "positions": self._get_positions(input_batch_size),
-                "inputs_embeds": inputs_embeds,
-            }
-            if self.pass_hidden_states_to_model:
-                model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
-            model_kwargs = self._add_spec_step_idx(model_kwargs, spec_step_idx)
-            model_kwargs = self._prepare_model_kwargs_for_aot(model_kwargs)
-
-            if profile_events is not None:
-                metadata_name = f"loop{token_index}_metadata_cpu"
-                self._step_profiler.add_cpu_ms(
-                    profile_cpu_ms, metadata_name, loop_cpu_start
-                )
-                profile_cpu_ms["loop_metadata_cpu"] = (
-                    profile_cpu_ms.get("loop_metadata_cpu", 0.0)
-                    + profile_cpu_ms[metadata_name]
-                )
-
-            loop_forward_start = self._step_profiler.start(profile_events)
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch_size,
-                num_tokens_across_dp=batch_size_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=self._batch_descriptor_for_spec_step(
-                    batch_descriptor, spec_step_idx
-                ),
-                slot_mapping=self._get_slot_mapping(input_batch_size),
-            ):
-                ret_hidden_states = self.model(**model_kwargs)
-                if not self.model_returns_tuple():
-                    last_hidden_states = ret_hidden_states
-                    hidden_states = ret_hidden_states
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds[:input_batch_size]
                 else:
-                    last_hidden_states, hidden_states = ret_hidden_states
-            self._step_profiler.finish(
-                profile_events, f"loop{token_index}_forward", loop_forward_start
-            )
+                    input_ids = self.input_ids[:input_batch_size]
+                    inputs_embeds = None
 
-            hidden_states = hidden_states[:batch_size]
-            loop_sample_start = self._step_profiler.start(profile_events)
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size],
-                sampling_metadata,
-                spec_step_idx=spec_step_idx,
-            )
-            self._step_profiler.finish(
-                profile_events, f"loop{token_index}_sample", loop_sample_start
-            )
-            if draft_probs is not None:
-                assert draft_probs_list is not None
-                draft_probs_list.append(draft_probs)
-            draft_token_ids_list.append(draft_token_ids)
+                # Run the model.
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "positions": self._get_positions(input_batch_size),
+                    "inputs_embeds": inputs_embeds,
+                }
+                if self.pass_hidden_states_to_model:
+                    model_kwargs["hidden_states"] = self.hidden_states[
+                        :input_batch_size
+                    ]
+                model_kwargs = self._add_spec_step_idx(model_kwargs, spec_step_idx)
+                model_kwargs = self._prepare_model_kwargs_for_aot(model_kwargs)
+
+                if profile_events is not None:
+                    metadata_name = f"loop{token_index}_metadata_cpu"
+                    self._step_profiler.add_cpu_ms(
+                        profile_cpu_ms, metadata_name, loop_cpu_start
+                    )
+                    profile_cpu_ms["loop_metadata_cpu"] = (
+                        profile_cpu_ms.get("loop_metadata_cpu", 0.0)
+                        + profile_cpu_ms[metadata_name]
+                    )
+
+                loop_forward_start = self._step_profiler.start(profile_events)
+                with set_forward_context(
+                    per_layer_attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch_size,
+                    num_tokens_across_dp=batch_size_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=self._batch_descriptor_for_spec_step(
+                        batch_descriptor, spec_step_idx
+                    ),
+                    slot_mapping=self._get_slot_mapping(input_batch_size),
+                ):
+                    ret_hidden_states = self.model(**model_kwargs)
+                    if not self.model_returns_tuple():
+                        last_hidden_states = ret_hidden_states
+                        hidden_states = ret_hidden_states
+                    else:
+                        last_hidden_states, hidden_states = ret_hidden_states
+                self._step_profiler.finish(
+                    profile_events, f"loop{token_index}_forward", loop_forward_start
+                )
+
+                hidden_states = hidden_states[:batch_size]
+                loop_sample_start = self._step_profiler.start(profile_events)
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    last_hidden_states[:batch_size],
+                    sampling_metadata,
+                    spec_step_idx=spec_step_idx,
+                )
+                self._step_profiler.finish(
+                    profile_events, f"loop{token_index}_sample", loop_sample_start
+                )
+                if draft_probs is not None:
+                    assert draft_probs_list is not None
+                    draft_probs_list.append(draft_probs)
+                draft_token_ids_list.append(draft_token_ids)
+        finally:
+            if share_mtp_topk_indices:
+                self.model.model.set_skip_topk(False)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
@@ -2180,6 +2199,17 @@ class SpecDecodeBaseProposer:
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
         self._maybe_initialize_static_draft_vocab()
+        inner_model = getattr(self.model, "model", None)
+        self.share_mtp_topk_indices = bool(
+            getattr(
+                self.vllm_config.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and inner_model is not None
+            and hasattr(inner_model, "set_skip_topk")
+            and hasattr(inner_model, "compact_topk_indices")
+        )
 
         if (
             self.parallel_drafting
