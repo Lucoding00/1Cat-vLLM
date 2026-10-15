@@ -254,6 +254,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                     scope="local",
                 )
 
+        keep_replica_local_tp = not (
+            bool(getattr(parallel_config, "enable_expert_parallel", False))
+            or self.is_sequence_parallel
+        )
         self.experts = FusedMoE(
             shared_experts=self.shared_expert,
             gate=self.gate,
@@ -263,6 +267,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
+            tp_size=self.tp_size if keep_replica_local_tp else None,
+            dp_size=1 if keep_replica_local_tp else None,
+            pcp_size=1 if keep_replica_local_tp else None,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,

@@ -9172,6 +9172,23 @@ class GPUModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
+                if (
+                    self.vllm_config.parallel_config.data_parallel_size > 1
+                    and (
+                        spec_config.use_eagle()
+                        or spec_config.uses_draft_model()
+                        or spec_config.uses_extract_hidden_states()
+                    )
+                ):
+                    assert isinstance(
+                        self.drafter,
+                        EagleProposer
+                        | DFlashProposer
+                        | DraftModelProposer
+                        | ExtractHiddenStatesProposer
+                        | Gemma4Proposer,
+                    )
+                    self.drafter.dummy_run(1)
                 # Do not schedule any new drafts once the drafter cannot cover
                 # the current context. Returning zero-filled draft rows would
                 # make token id 0 look like a real speculative token to the

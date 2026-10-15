@@ -136,20 +136,28 @@ def _synchronize_dp_ranks(
         parallel_config=parallel_config,
     )
 
-    # Synchronize cudagraph_mode across ranks first (take min).
-    # This is needed before DP padding decision since we use the synced
-    # cudagraph mode to determine whether DP padding is needed.
-    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
-
     # Check conditions for microbatching
     should_ubatch = _post_process_ubatch(tensor, parallel_config.num_ubatches)
 
-    # DP padding is needed when cudagraph is enabled (synced across ranks)
-    # or when ubatching/DBO is active (ubatching requires uniform batch
-    # sizes across DP ranks currently).
-    # Use the synced runtime cudagraph mode rather than the compilation config
-    # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    requires_cross_dp_moe_sync = bool(
+        getattr(parallel_config, "enable_expert_parallel", False)
+        or getattr(parallel_config, "use_sequence_parallel_moe", False)
+    )
+    if requires_cross_dp_moe_sync or should_ubatch:
+        # Synchronize cudagraph_mode across ranks first (take min).
+        # This is needed before DP padding decision since we use the synced
+        # cudagraph mode to determine whether DP padding is needed.
+        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+
+        # DP padding is needed when cudagraph is enabled (synced across ranks)
+        # or when ubatching/DBO is active (ubatching requires uniform batch
+        # sizes across DP ranks currently).
+        # Use the synced runtime cudagraph mode rather than the compilation config
+        # so we can avoid padding when cudagraph is not enabled for this step.
+        should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    else:
+        synced_cudagraph_mode = cudagraph_mode
+        should_dp_pad = False
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True

@@ -470,3 +470,64 @@ def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:
     Qwen4ExpModel.load_weights(self_stub, iter([]))
     assert "hyper_connection_mixer." not in captured["skip"]
     assert "hyper_connection_mixer.block_inject_weight" in captured["skip"]
+
+
+def test_qwen3_next_sparse_moe_keeps_replica_local_tp_under_dp(monkeypatch) -> None:
+    """Under DP>1 with enable_expert_parallel=False, Qwen3NextSparseMoeBlock must
+    pass tp_size=self.tp_size, dp_size=1, pcp_size=1 to FusedMoE so that SM70
+    NVFP4 MoE is not flattened to dp_size * tp_size (e.g. 2 * 4 = 8)."""
+    import vllm.model_executor.models.qwen3_next as qwen3_next_module
+
+    captured_kwargs: dict[str, object] = {}
+
+    class _FakeFusedMoE(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured_kwargs.update(kwargs)
+
+    class _FakeLinear(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(qwen3_next_module, "FusedMoE", _FakeFusedMoE)
+    monkeypatch.setattr(qwen3_next_module, "ReplicatedLinear", _FakeLinear)
+    monkeypatch.setattr(
+        qwen3_next_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(
+        qwen3_next_module,
+        "get_ep_group",
+        lambda: SimpleNamespace(
+            device_group=SimpleNamespace(size=lambda: 8),
+            rank_in_group=0,
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                num_experts=512,
+                num_experts_per_tok=10,
+                hidden_size=2048,
+                moe_intermediate_size=512,
+                shared_expert_intermediate_size=0,
+                hidden_act="silu",
+                norm_topk_prob=True,
+            )
+        ),
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=False,
+            enable_expert_parallel=False,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+        quant_config=None,
+    )
+    monkeypatch.setattr(
+        qwen3_next_module, "get_current_vllm_config", lambda: vllm_config
+    )
+
+    Qwen3NextSparseMoeBlock(vllm_config, prefix="model.layers.0.mlp")
+    assert captured_kwargs["tp_size"] == 4
+    assert captured_kwargs["dp_size"] == 1
+    assert captured_kwargs["pcp_size"] == 1
+

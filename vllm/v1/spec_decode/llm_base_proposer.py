@@ -2443,16 +2443,17 @@ class SpecDecodeBaseProposer:
             )
 
         for fwd_idx in fwd_indices:
-            (
-                cudagraph_runtime_mode,
-                num_input_tokens,
-                num_tokens_across_dp,
-                batch_descriptor,
-            ) = self._determine_batch_execution_and_padding(
-                num_tokens, use_cudagraphs=use_cudagraphs
-            )
+            if fwd_idx <= 1 or is_graph_capturing or spec_step_idx is not None:
+                (
+                    cudagraph_runtime_mode,
+                    num_input_tokens,
+                    num_tokens_across_dp,
+                    base_batch_descriptor,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens, use_cudagraphs=use_cudagraphs
+                )
             batch_descriptor = self._batch_descriptor_for_spec_step(
-                batch_descriptor, fwd_idx
+                base_batch_descriptor, fwd_idx
             )
 
             # Make sure to use EAGLE's own buffer during cudagraph capture.
