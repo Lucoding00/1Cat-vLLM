@@ -2719,7 +2719,15 @@ def qsa_sparse_paged_attention(
     dcp_h_per_rank = (
         dcp_packed_out.shape[2] if dcp_packed_out is not None else q.shape[1]
     )
-    output_gate_view = output_gate.view_as(q) if output_gate is not None else None
+    output_gate_view = (
+        None
+        if output_gate is None
+        else (
+            output_gate
+            if output_gate.shape == q.shape
+            else output_gate.reshape(q.shape)
+        )
+    )
     if output_gate_view is not None:
         if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
             raise ValueError("QSA output gate must match the query dtype and device")

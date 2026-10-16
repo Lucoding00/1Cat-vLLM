@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -104,7 +105,7 @@ def _lse_weighted_combine(
 
 
 _DCP_A2A_BUFFERS: dict[
-    tuple[torch.device, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+    tuple[int, int, torch.dtype], tuple[int, torch.Tensor, torch.Tensor]
 ] = {}
 
 
@@ -132,20 +133,24 @@ def _dcp_a2a_send_recv_buffers(
     needed = 1
     for dim in shape:
         needed *= dim
-    if device.type == "cuda" and not torch.cuda.is_current_stream_capturing():
-        stream_id = torch.cuda.current_stream(device).cuda_stream
-        key = (device, stream_id, dtype)
-        cached = _DCP_A2A_BUFFERS.get(key)
-        if cached is None or cached[0].numel() < needed:
+    if device.type == "cuda":
+        device_index = device.index if device.index is not None else -1
+        stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+        key = (device_index, stream_id, dtype)
+        cache = workspace_cache("dcp_a2a_send_recv", _DCP_A2A_BUFFERS)
+        cached = cache.get(key)
+        if cached is None or cached[0] < needed:
             cap = 1 << (max(needed, 1) - 1).bit_length()
             if cached is not None:
-                cap = max(cap, cached[0].numel())
+                cap = max(cap, cached[0])
             cached = (
+                cap,
                 torch.empty((cap,), device=device, dtype=dtype),
                 torch.empty((cap,), device=device, dtype=dtype),
             )
-            _DCP_A2A_BUFFERS[key] = cached
-        return cached[0][:needed].view(shape), cached[1][:needed].view(shape)
+            cache[key] = cached
+        retain_for_capture(cache, cached, cached[1])
+        return cached[1][:needed].view(shape), cached[2][:needed].view(shape)
 
     return (
         torch.empty(shape, device=device, dtype=dtype),

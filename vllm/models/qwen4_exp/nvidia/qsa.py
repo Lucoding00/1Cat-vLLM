@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -68,6 +69,16 @@ from ..common.qsa_cache import (
 from .indexer_qsa import QSAIndexer
 
 logger = init_logger(__name__)
+
+_SM70_QSA_DCP_AG_WORKSPACES: dict[
+    tuple[int, int, torch.dtype], tuple[int, torch.Tensor, torch.Tensor]
+] = {}
+_SM70_QSA_DCP_VALID_COUNTS_WORKSPACES: dict[
+    tuple[int, int], tuple[int, torch.Tensor]
+] = {}
+_SM70_QSA_PREPARED_Q_WORKSPACES: dict[
+    tuple[int, int, torch.dtype], tuple[int, torch.Tensor]
+] = {}
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -417,43 +428,38 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         rows, heads, dim = q_contig.shape
         world_size = self.dcp_world_size
         needed = world_size * rows * heads * dim
-        recv_buf = getattr(self, "_dcp_ag_recv_buffer", None)
-        if (
-            recv_buf is None
-            or recv_buf.numel() < needed
-            or recv_buf.dtype != q_contig.dtype
-            or recv_buf.device != q_contig.device
-        ):
-            cap = 1 << (max(needed, 1) - 1).bit_length()
-            if (
-                recv_buf is not None
-                and recv_buf.device == q_contig.device
-                and recv_buf.dtype == q_contig.dtype
-            ):
-                cap = max(cap, recv_buf.numel())
-            recv_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
-            self._dcp_ag_recv_buffer = recv_buf
-        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
-        out_buf: torch.Tensor | None = None
-        if rows > 1:
-            out_buf = getattr(self, "_dcp_ag_out_buffer", None)
-            if (
-                out_buf is None
-                or out_buf.numel() < needed
-                or out_buf.dtype != q_contig.dtype
-                or out_buf.device != q_contig.device
-            ):
+        if q_contig.is_cuda:
+            device_index = (
+                q_contig.device.index if q_contig.device.index is not None else -1
+            )
+            stream_id = int(torch.cuda.current_stream(q_contig.device).cuda_stream)
+            ws_key = (device_index, stream_id, q_contig.dtype)
+            ws_cache = workspace_cache("qsa_dcp_ag", _SM70_QSA_DCP_AG_WORKSPACES)
+            workspace = ws_cache.get(ws_key)
+            if workspace is None or workspace[0] < needed:
                 cap = 1 << (max(needed, 1) - 1).bit_length()
-                if (
-                    out_buf is not None
-                    and out_buf.device == q_contig.device
-                    and out_buf.dtype == q_contig.dtype
-                ):
-                    cap = max(cap, out_buf.numel())
+                if workspace is not None:
+                    cap = max(cap, workspace[0])
+                recv_buf = torch.empty(
+                    (cap,), dtype=q_contig.dtype, device=q_contig.device
+                )
                 out_buf = torch.empty(
                     (cap,), dtype=q_contig.dtype, device=q_contig.device
                 )
-                self._dcp_ag_out_buffer = out_buf
+                workspace = (cap, recv_buf, out_buf)
+                ws_cache[ws_key] = workspace
+            retain_for_capture(ws_cache, workspace, q_contig)
+            _, recv_buf, out_buf = workspace
+        else:
+            recv_buf = torch.empty(
+                (needed,), dtype=q_contig.dtype, device=q_contig.device
+            )
+            out_buf = (
+                torch.empty((needed,), dtype=q_contig.dtype, device=q_contig.device)
+                if rows > 1
+                else None
+            )
+        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
         work = torch.distributed.all_gather_into_tensor(
             recv_view, q_contig, group=device_group, async_op=True
         )
@@ -535,20 +541,35 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         resolve_physical = bool(key_cache.shape[0] * key_cache.shape[1] < 2**31)
         rows = query.shape[0]
-        counts_buf = getattr(self, "_dcp_valid_counts_buffer", None)
-        if (
-            counts_buf is None
-            or counts_buf.numel() < rows
-            or counts_buf.device != logical_indices.device
-        ):
-            cap = 1 << (max(rows, 1) - 1).bit_length()
-            if counts_buf is not None and counts_buf.device == logical_indices.device:
-                cap = max(cap, counts_buf.numel())
-            counts_buf = torch.empty(
-                (cap,), dtype=torch.int32, device=logical_indices.device
+        if logical_indices.is_cuda:
+            device_index = (
+                logical_indices.device.index
+                if logical_indices.device.index is not None
+                else -1
             )
-            self._dcp_valid_counts_buffer = counts_buf
-        local_valid_counts = counts_buf[:rows]
+            stream_id = int(
+                torch.cuda.current_stream(logical_indices.device).cuda_stream
+            )
+            counts_key = (device_index, stream_id)
+            counts_cache = workspace_cache(
+                "qsa_dcp_valid_counts", _SM70_QSA_DCP_VALID_COUNTS_WORKSPACES
+            )
+            counts_ws = counts_cache.get(counts_key)
+            if counts_ws is None or counts_ws[0] < rows:
+                cap = 1 << (max(rows, 1) - 1).bit_length()
+                if counts_ws is not None:
+                    cap = max(cap, counts_ws[0])
+                counts_buf = torch.empty(
+                    (cap,), dtype=torch.int32, device=logical_indices.device
+                )
+                counts_ws = (cap, counts_buf)
+                counts_cache[counts_key] = counts_ws
+            retain_for_capture(counts_cache, counts_ws, logical_indices)
+            local_valid_counts = counts_ws[1][:rows]
+        else:
+            local_valid_counts = torch.empty(
+                (rows,), dtype=torch.int32, device=logical_indices.device
+            )
         local_indices = qsa_localize_dcp_indices(
             logical_indices,
             local_indices_buffer[:rows, :local_width],
@@ -561,12 +582,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
             valid_counts=local_valid_counts,
         )
+        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
         partial_output = partial_output_buffer[:rows]
         partial_lse = partial_lse_buffer[:rows]
+        if partial_output.shape != gathered_query.shape:
+            raise RuntimeError("QSA DCP partial output has wrong head geometry")
         use_fused_a2a_pack = bool(
             self.dcp_combine is dcp_a2a_lse_reduce
             and self.dcp_world_size > 1
             and partial_output.dtype == torch.float32
+            and gathered_query.shape[1] % self.dcp_world_size == 0
         )
         send_buffer: torch.Tensor | None = None
         recv_buffer: torch.Tensor | None = None
@@ -575,15 +600,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 (
                     self.dcp_world_size,
                     rows,
-                    query.shape[1],
-                    query.shape[2] + 1,
+                    gathered_query.shape[1] // self.dcp_world_size,
+                    gathered_query.shape[2] + 1,
                 ),
                 device=partial_output.device,
                 dtype=partial_output.dtype,
             )
-        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
-        if partial_output.shape != gathered_query.shape:
-            raise RuntimeError("QSA DCP partial output has wrong head geometry")
         qsa_sparse_paged_attention(
             gathered_query,
             key_cache,
@@ -600,7 +622,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             dcp_packed_out=send_buffer,
             valid_counts=local_valid_counts,
         )
-        gate_view = output_gate.view_as(output)
+        gate_view = (
+            output_gate
+            if output_gate.shape == output.shape
+            else output_gate.reshape(output.shape)
+        )
         if self.dcp_combine is dcp_a2a_lse_reduce:
             dcp_a2a_lse_reduce(
                 partial_output,
@@ -1150,25 +1176,33 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self._cached_raw_kv_unbind_key = kv_cache_key
                 self._cached_raw_kv_unbind_pair = (key_cache, value_cache)
             needed_q = num_tokens * self.num_heads * self.head_dim
-            prep_buf = getattr(self, "_prepared_q_buffer", None)
-            if (
-                prep_buf is None
-                or prep_buf.numel() < needed_q
-                or prep_buf.dtype != query.dtype
-                or prep_buf.device != query.device
-            ):
-                cap = 1 << (max(needed_q, 1) - 1).bit_length()
-                if (
-                    prep_buf is not None
-                    and prep_buf.device == query.device
-                    and prep_buf.dtype == query.dtype
-                ):
-                    cap = max(cap, prep_buf.numel())
-                prep_buf = torch.empty((cap,), dtype=query.dtype, device=query.device)
-                self._prepared_q_buffer = prep_buf
-            prepared = prep_buf[:needed_q].view(
-                num_tokens, self.num_heads, self.head_dim
-            )
+            if query.is_cuda:
+                device_index = (
+                    query.device.index if query.device.index is not None else -1
+                )
+                stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+                prep_key = (device_index, stream_id, query.dtype)
+                prep_cache = workspace_cache(
+                    "qsa_prepared_q", _SM70_QSA_PREPARED_Q_WORKSPACES
+                )
+                prep_ws = prep_cache.get(prep_key)
+                if prep_ws is None or prep_ws[0] < needed_q:
+                    cap = 1 << (max(needed_q, 1) - 1).bit_length()
+                    if prep_ws is not None:
+                        cap = max(cap, prep_ws[0])
+                    prep_buf = torch.empty(
+                        (cap,), dtype=query.dtype, device=query.device
+                    )
+                    prep_ws = (cap, prep_buf)
+                    prep_cache[prep_key] = prep_ws
+                retain_for_capture(prep_cache, prep_ws, query)
+                prepared = prep_ws[1][:needed_q].view(
+                    num_tokens, self.num_heads, self.head_dim
+                )
+            else:
+                prepared = query.new_empty(
+                    (num_tokens, self.num_heads, self.head_dim)
+                )
             text_positions = (positions[0] if positions.dim() == 2 else positions)[
                 :num_tokens
             ]
@@ -1254,7 +1288,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
-        if self._sm70_qsa_prep and num_tokens >= 1:
+        if self._sm70_qsa_prep and num_tokens <= 32:
             # Raw rows go to the attention op, which normalizes, rotates and
             # caches them in one launch; the gate stays strided in q_gate.
             q_gate = qkv[:, : self.q_size * 2].view(

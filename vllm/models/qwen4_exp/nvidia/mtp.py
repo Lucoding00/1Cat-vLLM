@@ -77,8 +77,11 @@ from .model import (
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
 logger = init_logger(__name__)
+
+_SM70_MTP_COMPACT_TOPK_WORKSPACES: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 @triton.jit
@@ -364,7 +367,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.topk_indices_buffer = topk_indices_buffer
             if draft_vllm_config.parallel_config.decode_context_parallel_size == 2:
                 tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
-                local_q_heads = int(config.num_attention_heads) // max(tp_size, 1)
+                gathered_heads = (
+                    int(config.num_attention_heads) // max(tp_size, 1) * 2
+                )
                 head_dim = int(
                     getattr(
                         config,
@@ -379,13 +384,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 )
                 dcp_partial_output_buffer = torch.empty(
                     max_tokens,
-                    local_q_heads,
+                    gathered_heads,
                     head_dim,
-                    dtype=model_config.dtype,
+                    dtype=torch.float32,
                 )
                 dcp_partial_lse_buffer = torch.empty(
                     max_tokens,
-                    local_q_heads,
+                    gathered_heads,
                     dtype=torch.float32,
                 )
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
@@ -498,7 +503,15 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     num_warps=2,
                 )
             elif buffer.device.type == "cuda":
-                scratch = getattr(self, "_compact_topk_scratch", None)
+                device_index = (
+                    buffer.device.index if buffer.device.index is not None else -1
+                )
+                stream_id = int(torch.cuda.current_stream(buffer.device).cuda_stream)
+                ws_key = (device_index, stream_id, width)
+                ws_cache = workspace_cache(
+                    "qsa_mtp_compact_topk", _SM70_MTP_COMPACT_TOPK_WORKSPACES
+                )
+                scratch = ws_cache.get(ws_key)
                 if (
                     scratch is None
                     or scratch.shape[0] < num_rows
@@ -506,11 +519,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     or scratch.dtype != buffer.dtype
                     or scratch.device != buffer.device
                 ):
-                    cap = max(num_rows, buffer.shape[0])
+                    cap = 1 << (max(num_rows, 1) - 1).bit_length()
+                    if scratch is not None and scratch.device == buffer.device:
+                        cap = max(cap, scratch.shape[0])
                     scratch = torch.empty(
                         (cap, width), dtype=buffer.dtype, device=buffer.device
                     )
-                    object.__setattr__(self, "_compact_topk_scratch", scratch)
+                    ws_cache[ws_key] = scratch
+                retain_for_capture(ws_cache, scratch, buffer)
                 selected = scratch[:num_rows]
                 torch.index_select(buffer, 0, row_indices, out=selected)
                 buffer[:num_rows].copy_(selected)

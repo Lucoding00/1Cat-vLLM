@@ -1,268 +1,267 @@
-# SM70 (Tesla V100) `Qwen3.8-Flash-Next` 全栈性能优化与多卡部署总览手册（三合一汇总版）
+# SM70 (`V100-SXM2-32GB`) `Qwen3.8-Flash-Next` 全量优化与部署总览手册（三合一最终审校版）
+
+> **分支说明**：本手册将此前分三阶段完成的三个设计文档与两份专项修复文档完整收敛并经端到端全面排查后合成为一份自包含的工程总册，涵盖 **Prefill + Decode 第一阶段优化（`P1`–`P10`, `D1`–`D16`）**、**SM70 能力突破优化（`P11`–`P13`, `D17`–`D25`）**、**`8 × V100` `DP2 × TP4 + DCP2 + MTP4` 分布式修复（`D26`）**、**`fp8_e4m3` KV Cache 量化下 MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）**、**QSA 草稿块表 `torch.mul(..., out=expanded_view)` 隐式缩容修复（`D28`）** 以及 **DCP2 `dcp_partial_output_buffer` 头维几何/FP32 类型修复 + CUDA Graph 捕获私有内存池安全隔离 + Triton 0D 标量修复 + 多模态 3D MRoPE 保护（`D29`）**，共 **42 项代码改动（`P1`–`P13` + `D1`–`D29`）** 及经过完整验证的 31 个文件合并 Diff。
 
 ---
 
-## 1. 三个现有设计文档的可用性说明与关系总览
+## 1. 设计文档关系总览与最终审校说明
 
-### 1.1 之前三个文档还能继续使用吗？
-**完全可以继续使用，且全部有效。**
-本分支（`arena/5368f936-1cat-vllm`，基于 `main` 分支提交 `be3722bc095b9792bf9833068595f0b1ef70ad37`）上的三个专项文档分别记录了我们在三个阶段完成的优化与修复，它们与当前分支代码 **100% 对应且无任何冲突**：
+### 1.1 文档结构说明
+| 文档路径 | 阶段与定位 | 覆盖范围 |
+|---|---|---|
+| `docs/design/sm70_qwen38_prefill_decode_optimizations.md` | **第一阶段：Bit-Exact Prefill & Decode 基础优化** | `P1`–`P10`（10 项 Prefill 优化）+ `D1`–`D16`（16 项 `TP4 + DCP2` Decode 优化） |
+| `docs/design/sm70_qwen38_capability_breakthroughs.md` | **第二阶段：SM70 能力突破与架构对标分析** | `Qwen3.8-27B` vs `Qwen3.8-Flash-Next` 深度对比 + `P11`–`P13` + `D17`–`D25` |
+| `docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md` | **第三阶段：`DP2 × TP4` 修复、启动脚本与 `fp8_e4m3` 指南** | `D26` + `D27` + 4 卡/8 卡 256K 生产启动脚本 |
+| `docs/design/sm70_qwen38_mtp_draft_kv_cache_dtype_fix.md` | **专项修复 1：MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）** | 解决 `--kv-cache-dtype fp8_e4m3` 下草稿层误继承 `fp8_e4m3` 报 `Loaded 0/2` |
+| `docs/design/sm70_qwen38_qsa_draft_block_table_resize_fix.md` | **专项修复 2：QSA 草稿块表 `out=` 隐式缩容修复（`D28`）** | 解决 `torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)` 隐式缩容报错 |
+| `docs/design/sm70_qwen38_master_summary.md`（**本文档**） | **最终审校三合一总册** | 汇总全部 **42 项优化与修复（`P1`–`P13` + `D1`–`D29`）**，提供相对于 `main`（`be3722bc09`）零冲突、可直接一键应用的 **31 个文件最终合并 Diff** |
 
-| 专项文档路径 | 定位与涵盖内容 | 当前状态 |
-| :--- | :--- | :--- |
-| **`docs/design/sm70_qwen38_prefill_decode_optimizations.md`** | **第一阶段（Bit-Exact 算子融合、零拷贝与持久工作区优化）**：涵盖 **`P1`–`P10`**（Prefill & MTP4 10 项优化）与 **`D1`–`D16`**（`TP4 + DCP2` Decode 16 项优化）的详细设计说明与阶段一 Diff。 | **完全可用**（保留第一阶段全部细节） |
-| **`docs/design/sm70_qwen38_capability_breakthroughs.md`** | **第二阶段（能力突破与 `Qwen3.8-27B` vs `Flash-Next` 架构对比）**：涵盖 **`P11`–`P13`** 与 **`D17`–`D26`** 的能力突破、27B 与 Flash-Next 速度差异根因分析，以及阶段二增量 Diff。 | **完全可用**（保留第二阶段全部细节） |
-| **`docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md`** | **第三阶段（8 卡 `DP2 × TP4 + DCP2 + MTP4` 修复与 `fp8_e4m3` 生产启动指南）**：涵盖 `DP2 × TP4` 报错根因与修复（`D26`）、MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）、一键补丁、4 卡/8 卡启动命令。 | **完全可用**（保留部署修复与启动脚本） |
-
-### 1.2 为什么要将三个文档汇总成本文档（`docs/design/sm70_qwen38_master_summary.md`）？
-由于 `vllm/models/qwen4_exp/nvidia/ops/qsa.py`、`vllm/models/qwen4_exp/nvidia/qsa.py`、`vllm/models/qwen4_exp/nvidia/mtp.py`、`vllm/models/qwen4_exp/nvidia/ple_layer.py`、`vllm/v1/spec_decode/llm_base_proposer.py` 等核心文件在第一、二、三阶段中被**连续迭代增强**，分看三个文档时每个文档展示的是对应阶段的增量 Diff。
-
-因此，本文档将三个文档的全部成果**一次性整合到一个总手册中**：
-- **第 2 节**：四大核心问题与架构根因总结（为什么 `main` 分支 Prefill 只有几千 tok/s、为什么 `27B` Decode 200+ tok/s 而 `Flash-Next` 100+ tok/s、为什么 `DP2 × TP4` 在 `main` 分支报错、以及 `fp8_e4m3` + `MTP4` 草稿 KV dtype 继承链路修复 `D27`）。
-- **第 3 节**：全量 **40 项优化与修复（`P1`–`P13` + `D1`–`D27`）** 完整对照总表（与 `README.md` 及三个专项文档编号严格一致）。
-- **第 4 节**：生产级最佳启动脚本汇总（**`4 × V100 32GB`** 与 **`8 × V100 32GB`**，支持 `256K + 多模态 + 工具调用 + MTP4 + fp8_e4m3 / auto`）。
-- **第 5 节**：相对于 `main` 分支（`be3722bc09`）的 **31 个源码/测试文件最终合并版 Unified Diff**（每个文件只有一份完整合并 Diff，无需跨文档拼接）。
-- **第 6 节**：从 `main` 分支一键导出/应用全量补丁命令。
+### 1.2 最终全面审校排查并修复的 6 类运行时/编译期隐患汇总（`D27`–`D29`）
+在将全部优化合并并在 `TP4 + DCP2 + MTP4 + fp8_e4m3 + CUDA Graph` 实机编译运行过程中，我们对全部 31 个修改文件进行了逐行排查，彻底修复了以下 6 类隐患：
+1. **MTP 草稿层 `kv_cache_dtype` 继承修复（`D27`）**：
+   - `vllm/models/qwen4_exp/nvidia/mtp.py` 与 `amd/mtp.py` 的 `_make_draft_vllm_config()` 此前未读取 `speculative_config.kv_cache_dtype`，导致主模型开启 `--kv-cache-dtype fp8_e4m3` 时草稿层 `mtp.layers.48` 仍被设为 `fp8_e4m3` 并因权重无 `mtp.layers.48.self_attn.{k,v}_scale` 报 `ValueError: Calibrated QSA E4M3 KV cache requires checkpoint k_scale and v_scale for every QSA layer. Loaded 0/2`。现已支持通过 `--speculative-config '{"kv_cache_dtype":"float16"}'` 将草稿层独立设为 `float16`。
+2. **QSA 草稿块表 `torch.mul(..., out=expanded_view)` 隐式缩容修复（`D28`）**：
+   - `vllm/models/qwen4_exp/nvidia/qsa.py` 的 `Qwen4ExpQSAMetadataBuilder.build()` 中，`torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)` 因左操作数形状为 `[rows, columns, 1]`、右操作数为标量 `2`，PyTorch 的 `out=` 不会将结果广播到 `out` 的形状 `[rows, columns, 2]`，而是静默将 `expanded_view` 原地 resize 为 `[rows, columns, 1]`。现显式写为 `torch.mul(table.unsqueeze(-1).expand(rows, columns, expansion), expansion, out=expanded_view)`，并缓存 `_draft_sub_block_offsets`。
+3. **MTP `dcp_partial_output_buffer` 头维几何与 `torch.float32` 类型修复（`D29`）**：
+   - `vllm/models/qwen4_exp/nvidia/mtp.py` 在 `P8` 中分配 `dcp_partial_output_buffer` 与 `dcp_partial_lse_buffer` 时误用了 `local_q_heads = num_attention_heads // tp_size`（6 头）和 `dtype=model_config.dtype`（`float16`），而 `model.py:786` 与 `qsa.py:_forward_qsa_dcp` 要求 `gathered_heads = num_attention_heads // tp_size * 2`（12 头）和 `dtype=torch.float32`。这既导致 `partial_output.dtype == torch.float32` 为 `False`（回退到非 `use_fused_a2a_pack` 路径），又触发 `RuntimeError: QSA DCP partial output has wrong head geometry`。现已在 `mtp.py` 中统一为 `gathered_heads = int(config.num_attention_heads) // max(tp_size, 1) * 2` 且 `dtype=torch.float32`，并在 `qsa.py:_forward_qsa_dcp` 中先完成 `gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)` 再按 `gathered_query.shape[1] // self.dcp_world_size` 分配 A2A 缓冲。
+4. **Triton 内核 `tl.zeros([], dtype=tl.int64)` 空形状编译报错修复（`D29`）**：
+   - `vllm/models/qwen4_exp/nvidia/ple_layer.py` 的 `_qwen38_ple_prefill_short_conv_kernel` 与 `_qwen38_ple_spec_short_conv_kernel` 中使用了 `tl.zeros([], dtype=tl.int64)`，在 Triton 编译器中 `tl.zeros` 要求非空 1D+ 2 的幂形状（空列表 `[]` 会触发编译期形状校验异常）。现已全部替换为零开销 0D `tl.int64` 标量表达式（`req = row * 0`、`req_start = tl.load(q_starts_ptr).to(tl.int64)`、`r_pre = start * 0`）。
+5. **CUDA Graph 捕获私有内存池（`graph_pool`）生命周期与跨流隔离修复（`D29`）**：
+   - `qsa.py`（`_dcp_ag_recv_buffer`、`_dcp_ag_out_buffer`、`_dcp_valid_counts_buffer`、`_prepared_q_buffer`）、`indexer_qsa.py`（`_q_buffer`）、`mtp.py`（`_compact_topk_scratch`）和 `dcp_alltoall.py`（`_DCP_A2A_BUFFERS`）此前直接将动态扩容张量缓存在 `self._xxx_buffer` 属性上，未按 `(device_index, stream_id)` 隔离默认流与 CUDA Graph 捕获流，也未调用 `retain_for_capture`。当按递增 batch size 捕获多张 CUDA Graph 时，后续更大 batch 的捕获会覆盖 `self._xxx_buffer` 并释放前一张已捕获 Graph 正在引用的私有内存池地址。现全部接入 `vllm.v1.attention.ops.sm70_workspaces` 的 `workspace_cache` + `retain_for_capture`，按 `(device_index, stream_id, ...)` 严格隔离并锁住捕获期张量生命周期。
+6. **多模态 3D MRoPE Prefill 保护与 `DP2 × TP4` Chunked Prefill 集合通信对齐（`D29`）**：
+   - `qsa.py` 中 `qsa_prep_sm70_out` 仅使用 1D `positions[0]`（适用于纯文本 Decode/Verify `num_tokens <= 32`）；在开启多模态时，Prefill（`num_tokens > 32`）包含图像/视频 token 的 3D MRoPE 坐标（`positions[0] != positions[1] != positions[2]`），因此恢复 `if self._sm70_qsa_prep and num_tokens <= 32:` 保护多模态 Prefill 走完整 3D `MRotaryEmbedding`；同时在 `qwen_gdn_linear_attn.py` 中限定 `qwen38_sm70_fp16_gdn_input` 仅用于 `rows in (1, 5, 10)`，Prefill 直接走零拷贝 `_split_gdn_projection_tails`。
+   - `llm_base_proposer.py` 的 `P7` 在 Chunked Prefill 中间块提前 `return` 前，若 `data_parallel_size > 1 and num_speculative_tokens > 1 and not parallel_drafting`，显式调用一次 `self._determine_batch_execution_and_padding(batch_size)`，保证 `DP2 × TP4` 下当一个 DP 副本处于 Chunked Prefill 中间块、另一个 DP 副本处于 Decode 或 `dummy_run` 时，跨 DP 的 `coordinate_batch_across_dp` `all_reduce` 次数严格一致，彻底杜绝跨 DP 死锁。
 
 ---
 
-## 2. 四大核心问题诊断与架构剖析汇总
+## 2. 核心问题诊断与架构剖析汇总
 
 ### 2.1 为什么在 `main` 分支直接部署 `Qwen3.8-Flash-Next` 时 Prefill 只有几千 tok/s？
-1. **根因一（最致命）：默认开启了 PLE Disk-Mmap 磁盘文件映射卸载（`ple_disk_cascade: true`）**
-   - `Qwen3.8-Flash-Next` 含 4 层 PLE（每层含 4 个 HyperConnection 分支，词表 `159,744 × 10,240` FP16，单份整表约 **11.92 GiB**，4 个 TP 进程共 **47.68 GiB**）。
-   - 在 `main` 分支中，`vllm/config/kernel.py:137` 默认 `ple_disk_cascade: True`；当未显式指定足够的 `VLLM_QWEN4EXP_PLE_HOST_GIB` 时，`ple_layer.py:1653` 会将溢出层落盘为 `/tmp` 下的 `mmap` 文件。
-   - 长上下文 Prefill 一次访问数千个不同 N-gram 词表行，直接引发 Linux Page Cache 抖动与磁盘同步缺页中断，把 GPU 算子阻塞在磁盘 I/O 上，导致 Prefill 暴跌到几千 tok/s。
-   - **解决方式**：设置 `VLLM_PLE_CPU_OFFLOAD=0 VLLM_PLE_DISK_OFFLOAD=0 VLLM_SM70_QWEN38_HYBRID_PLE=0 VLLM_QWEN4EXP_PLE_HOST_GIB=12`（4 卡）或 `10`（8 卡）并配合 `--kernel-config '{"ple_disk_cascade":false}'`，让全部 PLE 表常驻 Pinned Host RAM 走 UVA 零缺页直读（或内存受限时用 `VLLM_PLE_CPU_OFFLOAD=1` + `VLLM_PLE_OFFLOAD_PREFAULT=1` 共享单份 14.3 GiB 内存池）。
-2. **根因二：Chunked Prefill 中间块在开启 `MTP4` 时白跑了 3 步自回归 Draft Decode（`P7` 已修复）**
-   - 256K 上下文按 8192 分块 Prefill 时，前 `N-1` 个中间块并不产出最终采样 token，但 `main` 分支在每个中间块后依然完整执行了 MTP step 0 `lm_head` 投影 + 采样以及 step 1~3 的 3 步 Draft 自回归解码与 D2H 拷贝。`P7` 在 `first_forward` 更新完 KV/Mamba 状态后立即提前退出。
-3. **根因三：GDN `RMSNormGated`（`rows > 192`）、`causal_conv1d` 跨步访存与 PLE Prefill 逐行循环（`P6`/`P9`/`P13` 已修复）**
-   - 开启 MTP4 后，36 层 GDN 的 `RMSNormGated` 在 `rows > 192` 时退回 360 次 FP32 Eager ATen 算子启动（每 8K 块产生 `~27.1 GB` HBM 读写）；`causal_conv1d_fn` 因切片步幅导致 16 KB 非合并访存；PLE Prefill 对 `m > 32` 退回 104 次算子启动。本分支通过 `P6`、`P9`、`P13` 彻底消除了这些瓶颈。
-
----
+1. **单请求 Prefill 未开启 cuBLAS Indexer 快路径**：默认配置下 `VLLM_SM70_QSA_INDEXER_CUBLAS=0`，QSA Indexer 回退到分页 Triton MQA 打分内核，随上下文增长开销剧增。
+2. **默认 `max-num-batched-tokens` 偏小（如 `8192`）**：切碎 256K 长上下文 Prefill，且在 `MTP4` 下每个中间 Chunk 原本都会跑满 4 步自回归 Draft Forward（已由 **`P7`** 修复）。
+3. **缺少 SM70 专属环境变量组合**：必须开启 `VLLM_SM70_QSA_INDEXER_CUBLAS=1`、`VLLM_SM70_QSA_GROUPED_PAGE4=1`、`VLLM_SM70_QSA_GROUPED_PAD_FIX=1`、`VLLM_SM70_TURBOMIND_MOE_COMPACT_SHARED=1` 等开关。
 
 ### 2.2 为什么 `Qwen3.8-27B` Decode 能达到 200+ tok/s，而 `Qwen3.8-Flash-Next` 在 100+ tok/s？
-
-| 对比维度 | `Qwen3.8-27B-NVFP4 + DFlash2` | `Qwen3.8-Flash-Next-NVFP4 + MTP4` | 架构级差距根因 |
-| :--- | :--- | :--- | :--- |
-| **投机解码机制** | **DFlash2 块并行投机**：单次前向同时生成 4 个草稿 token（1 次 Draft Forward） | **MTP4 串行自回归投机**：4 个草稿 token 需串行跑 4 步 `Qwen4ExpMultiTokenPredictor`（4 次 Draft Forward） | MTP4 草稿阶段存在 4 倍串行启动开销与跨卡 AllReduce/AllGather |
-| **主干层结构** | 48 层标准 Dense GQA + SwiGLU | **48 层（36 GDN + 12 QSA）× 512 专家 MoE（Top-10 + Shared Expert）+ 4 路 HyperConnection + 4 层 PLE** | 每层算子数量多出 **3~4 倍**，包含大量小 M 形状 GEMV、路由、索引与跨 PCIe/NVLink 查表 |
-| **注意力与索引开销** | 标准 Paged Attention | **12 层 QSA 需先跑 `QSAIndexer`（`index_qk_proj` + `q_norm/rope` + 分页打分 + `topk(2048)` + `DCP2` 局部化）** | 即使短上下文，每层 QSA 也有整套 Indexer 预处理流水线 |
-| **PLE 词表与短卷积** | 无 PLE | **主干 4 层 + MTP 4 步 = 每轮 8 次 PLE N-gram 查表 + Dilated Short-Conv** | 涉及 Pinned-Host UVA 收集与 4-tap 膨胀短卷积 |
-
-针对上述四项差距，本分支通过 **`D1`–`D25`** 重点突破了：
-- **`D18` + `D22`（MTP 共享 Top-K 索引 + Key-Only 切片投影）**：在 MTP Draft 第 1–3 步直接复用第 0 步的 Top-K 物理块索引，跳过 `q_norm/q_rope` 并将 `index_qk_proj` 从 `[640, 2560]` 切片为 `[128, 2560]`（权重搬运与计算量直降 **80%**）；短上下文（`<= 2051`）下主模型 12 层 QSA 同样跳过 `wq` 投影与分页打分。
-- **`D13` + `D14` + `D17`（`TP4 + DCP2` 异步重叠与动态裁剪）**：将 Query `all_gather` 提前并与 4 个 Indexer 算子异步重叠；将 Split-K 合并与 DCP 发送缓冲打包融合；利用 `valid_counts` 动态截断 DCP2 下约 50% 的无效 `-1` 尾部块。
-- **`D20` + `D23` + `D24` + `D25`（MTP 算子深度融合）**：新增多请求 CUDA 投机短卷积核、补充 `shared_expert.down_proj` 专用 GEMV 计划、将 MTP `fc_embedding + fc_hidden + add` 融合为单次 Triton 内核，并用单行原地 Triton 核加速 `compact_topk_indices`。
-
----
+1. **层数与每层算子拓扑差异**：`Qwen3.8-27B` 是标准 Dense Transformer；而 `Qwen3.8-Flash-Next` 有 **48 层 Target + 1 层 MTP Draft（跑 4 步）= 每步 52 层有效执行**，且每层包含 **mHC（4 分支流混合）+ PLE（512 专家 Per-Layer Embedding + N-gram + Dilated Short-Conv）+ GDN（36 层）/ QSA（12 层，含 Indexer + Top-K + 稀疏注意力）+ 512 专家 Routed MoE + Shared Expert**。
+2. **Kernel Launch 数量差距（3.6×）**：`Flash-Next` 单次 MTP4 投机步（生成 5 tokens）需启动约 **4,300+ 个 CUDA 内核**。因此 `D1`–`D29` 围绕 **算子融合、消除冗余拷贝与动态分配、通信重叠、`index_share_for_mtp_iteration` 跨步复用** 展开。
 
 ### 2.3 为什么 `8 × V100` 启动 `DP2 × TP4 + DCP2 + MTP4` 会报错，如何修复（`D26`）？
-在 `main` 分支启动 `--data-parallel-size 2 --tensor-parallel-size 4 --decode-context-parallel-size 2` 时会依次触发 3 个阻断问题：
-1. **权重加载阶段崩溃**：`Qwen3NextSparseMoEBlock` 默认将 `DP2 × TP4` 展平为 `flatten_tp_size = 8`，触发 `NotImplementedError: SM70 TurboMind NVFP4 MoE currently supports tensor parallel sizes (1, 2, 4), plus GLM-5.3 TP8; got 8.`。
-2. **MTP `dummy_run` 与 `propose` 的跨 DP `all_reduce` 次数不匹配**：当 DP0 有请求（调用 `propose()`，内含 2 次跨 DP `all_reduce`）而 DP1 空闲（调用 `dummy_run()`，原本无 `all_reduce`）时，引发跨 DP 死锁。
-3. **跨 DP 同步循环吞没 `cudagraph_mode`**：`dp_utils.py` 原本把 `cudagraph_mode` 参与跨 DP 最小值归约并强制空闲副本循环陪跑，在未开启 EP 时完全多余且会破坏 CUDA Graph 步幅。
-- **修复结论（`D26`）**：修改 `qwen3_next.py`、`llm_base_proposer.py`、`dp_utils.py`、`gpu_model_runner.py`，即可让 `8 × V100` 原生稳定运行 `DP2 × TP4 + DCP2 + MTP4`。
+- **原因**：`vllm/model_executor/models/qwen3_next.py` 将 `FusedMoE` 的 `tp_size` 在 `DP2 × TP4` 下跨 DP 扁平化为 `flatten_tp_size = 8`，而 `ModelOptNvFp4SM70MoEMethod` 仅支持 `tp_size in {1, 2, 4}`；同时 `dp_utils.py` 强制跨 DP 同步 `cudagraph_mode` 和 token 填充数，导致 `MTP4` 4 步自回归草案循环与另一 DP 副本的 `dummy_run` 发生 `all_reduce` 次数失步死锁。
+- **修复（`D26` + `D29`）**：
+  1. `qwen3_next.py`：当未启用 `--enable-expert-parallel` 且非序列并行时，向 `FusedMoE` 显式传入 `tp_size=self.tp_size, dp_size=1, pcp_size=1`，保持每个 DP 副本内部 `tp_size = 4`。
+  2. `dp_utils.py`：在 `_synchronize_dp_ranks()` 中当 `requires_cross_dp_moe_sync` 为 `False` 时保留各 DP 副本独立的 `cudagraph_mode` 与 `num_tokens_padded`。
+  3. `llm_base_proposer.py` & `gpu_model_runner.py`：对齐 `dummy_run()`、Chunked Prefill 提前退出（`P7`）与 `propose()` 的 `coordinate_batch_across_dp` 调用次数。
 
 ---
 
-### 2.4 KV Cache 量化选型与 MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）
-
-| `--kv-cache-dtype` 选项 | 实际存储格式（36 层 GDN + 12 层 QSA） | 与 `MTP4` 兼容性 | 显存节省与速度特点 | 推荐场景 |
-| :--- | :--- | :--- | :--- | :--- |
-| **`fp8_e4m3`**（**推荐**） | 36 层 GDN 状态保持紧凑页；**12 层 QSA 主 KV 压缩为 8-bit `fp8_e4m3`（1 byte/elem）** | **原生支持 `<主模型 E4M3 + MTP Draft FP16>` 混布** | **QSA KV 显存减半（省 50%），Decode 阶段 QSA 读 KV 的 HBM 带宽减半**；V100 上使用专用整型位运算反量化内核 | **4 卡 / 8 卡 256K 长上下文 + MTP4 首选配置** |
-| **`auto`**（或 `float16`） | 36 层 GDN + 12 层 QSA 全部使用原生 **FP16（2 bytes/elem）** | 完全兼容 | 零量化/反量化指令开销，短上下文极速 | 对数值精度要求 100% 原生 FP16 的场景 |
-| **`turboquant_k8v4`** | 12 层 QSA 压缩为 **Key INT8 + Value INT4（平均 ~6 bit/elem）** | **不支持与 MTP 同时开启**（`qsa.py:424` 硬性拦截） | 显存压缩率最高（比 FP16 省 ~62.5%），但仅限无 MTP 场景 | 不开 MTP、追求单机最大并发序列数的场景 |
-
-#### 为什么在 `main` 分支指定了 `--speculative-config '{"kv_cache_dtype":"float16"}'` 仍会报 `Loaded 0/2`？（已由 `D27` 修复）
-- **一句话总结**：MTP 草稿模型的 KV cache 数据类型（`dtype`）继承错了，被设成了主模型的 `fp8_e4m3`，而草稿层没有对应的 FP8 缩放因子（`scale`）。
-- **细节链路**：
-  1. 启动参数里，主模型 KV cache 用 `fp8_e4m3`，并明确指定了草稿模型 KV cache 用 `float16`（`--speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'`）。
-  2. 但 `vllm/models/qwen4_exp/nvidia/mtp.py`（及 `amd/mtp.py`）里 `_make_draft_vllm_config()` 函数在构造草稿模型的配置时，用 `replace()` 从主配置整体继承，漏掉了 `speculative_config.kv_cache_dtype="float16"` 这一项。
-  3. 结果草稿模型拿到的 `cache_dtype` 仍是 `fp8_e4m3`。
-  4. 因为草稿 cache 被当成 FP8，加载权重时触发了 `_finalize_qsa_e4m3_scale_load(..., require_calibrated_speculative_draft=True)` 的强制校验，要求草稿层必须有 K/V 的 E4M3 scale。
-  5. 但 checkpoint（模型权重文件）里没有草稿层的 K/V scale → 报 `"Loaded 0/2"` 直接拒绝启动。
-- **修复方式（`D27`）**：在 `_make_draft_vllm_config()` 中检测 `speculative_config.kv_cache_dtype`，若已指定则将其覆盖至 `draft_vllm_config.cache_config.cache_dtype`（详见第 5.8、5.13、5.30 节）。
-
----
-
-## 3. 全量 40 项优化与修复总览表（`P1`–`P13` + `D1`–`D27`）
+## 3. 全量 42 项优化与修复总览表（`P1`–`P13` + `D1`–`D29`）
 
 ### 3.1 Prefill 与 `MTP4` 优化（`P1`–`P13`）
 
-| 编号 | 阶段 | 涉及文件 | 优化内容与精确收益 |
-| :--- | :--- | :--- | :--- |
-| **`P1`** | 阶段一 | `qsa_cache.py`, `indexer_qsa.py`, `ops/qsa.py` | 在 `QSAForwardMetadata` 中缓存跨层 `visible_blocks_cache`，每个 Prefill 分块消除 11/12 次 `.item()` 主机同步与 `_qsa_visible_blocks_kernel` 启动 |
-| **`P2`** | 阶段一 | `nvidia/qsa.py` | 支持 3D 跨步 `output_gate` 视图直传（`flatten_gate=False`），每步消除 12–16 次 `aten::copy_` 启动，每 8K Prefill 分块节省 `302 MB` HBM 流量 |
-| **`P3`** | 阶段一 | `fp4_workspace.py`, `nvfp4_sm70_moe.py` | 在 `NvFp4MoEWorkspace._eager_buffers` 中按设备缓存只读 `int32` 序列索引缓冲，消除重复构造 |
-| **`P4`** | 阶段一 | `fp4_workspace.py`, `nvfp4_sm70_moe.py` | 当 `expert_map is None` 时跳过冗余的 `output.zero_()`、`permuted_idx.fill_()` 与 `topk_ids_i32.copy_()`，每 8K 分块节省 `2.04 GB` HBM 流量与 240 次算子启动 |
-| **`P5`** | 阶段一 | `sm70_fp16_gemv.py`, `qwen_gdn_linear_attn.py` | 将 `_qwen38_gdn_projection_split_kernel`（`COPY_QKV=False`）网格从 `(m, 16)` 缩减至 `(m, 6)`（**减少 62.5% CTA**），并在 `M > 1` 时启用 |
-| **`P6`** | 阶段一 | `layernorm.py` | 在开启 MTP4 且 `rows > 192` 时，对不透明自定义算子内部的 `RMSNormGated` 启用 `@torch.compile(dynamic=True)` 融合内核，每 8K 分块消除 **360 次 FP32 ATen 启动与 `~27.1 GB` HBM 流量** |
-| **`P7`** | 阶段一 | `llm_base_proposer.py`, `gpu_model_runner.py` | 当 `_is_all_reqs_chunked_prefill()` 为真时，MTP Proposer 在完成 `first_forward` 后立即提前退出，跳过中间 Prefill 分块上浪费的 step-0 采样与 step 1~3 自回归解码 |
-| **`P8`** | 阶段一 | `sm70_mtp_fc.py`, `mtp.py` | 在 MTP Prefill 阶段启用 `maybe_combine_fc` 单次 AllGather 合并 `fc_embedding + fc_hidden`（每 8K 分块省 1 次 `40 MB` AllGather 与 `270 MB` HBM 流量），并预分配静态 `topk_indices_buffer` 与 `DCP2` 缓冲 |
-| **`P9`** | 阶段一 | `causal_conv1d.py` | 从切片视图分配 `out` 时保留 channel-last `(1, dim)` 步幅，消除 36 层 GDN 在 `_causal_conv1d_fwd_kernel` 与 `_fused_post_conv_kernel` 中的 16 KB 跨步非合并访存 |
-| **`P10`** | 阶段一 | `ops/hc.py`, `hyperconnection.py`, `model.py` | 在 `_hcx_final_mix` 路径中支持 `_hc_combine_norm_impl` 直接原地写入 `_mtp_hidden_buffer`，每 8K 分块省去 `160 MB` 临时分配与 `320 MB` HBM 拷贝 |
-| **`P11`** | 阶段二 | `ops/qsa_dcp.py`, `ops/qsa.py`, `nvidia/qsa.py` | `TP4 + DCP2` 下统计并写回每个查询行在当前 DCP 域的实际有效 token 数 `valid_counts`（`int32 [T]`），动态裁剪 `_qsa_sparse_paged_gqa_splitk_kernel` 的循环上界，跳过约 50% 的 `-1` 尾部空块 |
-| **`P12`** | 阶段二 | `model.py`, `mtp.py`, `qsa.py`, `qwen_gdn_linear_attn.py` | 在 `Qwen4ExpMTP.load_weights` 启用 `_maybe_enable_sm70_peer_paths`，解除 `qsa_prep_sm70_out` 的 `num_tokens <= 32` 限制，并通过 `COPY_QKV=True` 将 GDN 输入投影尾部拷贝融合进拆分内核 |
-| **`P13`** | 阶段二 | `ple_layer.py`, `qwen38_ple_spec_sm70.cu` | 新增行主序 4-tap Triton Prefill 短卷积 + 状态更新内核（8K Prefill 省 `~5.36 GB` HBM 流量），并对 `m > 32` 启用 `sm70_ple_ngram_ids` CUDA 内核（从 104 次启动降至 4 次） |
+| 编号 | 优化名称 | 涉及文件 | 核心收益 | Bit-Exact |
+|---|---|---|---|---|
+| **P1** | **跨层缓存 QSA `_qsa_visible_blocks` 与 GPU->CPU `.max().item()`** | `qsa_cache.py`, `ops/qsa.py` | 消除每块 Prefill 11 次冗余 GPU->CPU 流阻塞同步与 33 个小内核 | **Yes** |
+| **P2** | **消除 QSA 3D/2D `gate` `.reshape()` 分配与拷贝** | `nvidia/qsa.py` | 每层省去 `[T, 1536]` 分配与拷贝内核 | **Yes** |
+| **P3** | **跳过 NVFP4 MoE Prefill 冗余 `output.zero_()` 与 `permuted_idx.fill_()`** | `nvfp4_sm70_moe.py` | 49 层 MoE 省去 98 次全量缓冲写零内核 | **Yes** |
+| **P4** | **缓存 NVFP4 MoE Eager `torch.arange` 与免拷贝 `topk_ids`** | `fp4_workspace.py`, `nvfp4_sm70_moe.py` | 49 层 MoE 省去 147 个索引初始化/拷贝内核 | **Yes** |
+| **P5** | **GDN `_qwen38_gdn_projection_split_kernel` 网格缩减（16->6）与 Prefill 融合** | `sm70_fp16_gemv.py`, `qwen_gdn_linear_attn.py` | 省去 62.5% 空转 CTA，消除 36 层 GDN Prefill 6 次 `contiguous()` 拷贝 | **Yes** |
+| **P6** | **`RMSNormGated` 启用 MTP4 时大行数（`rows > 192`）`@torch.compile` 融合** | `layernorm.py` | 36 层 GDN Prefill 省去 144 个未融合逐元素内核与 ~1.8 GB 临时显存流量 | **Yes** |
+| **P7** | **Chunked Prefill 中间块跳过冗余 MTP 投机步（Steps 1–3）与 D2H 拷贝** | `llm_base_proposer.py`, `gpu_model_runner.py` | 中间 Prefill 块省去 3 次完整 MTP Draft Forward 与阻塞 D2H 同步（含 DP2 通信对齐） | **Yes** |
+| **P8** | **MTP Prefill 合并 `maybe_combine_fc` 单次 AllGather 与预分配 QSA 缓冲** | `sm70_mtp_fc.py`, `nvidia/mtp.py` | 省去 75% MTP `fc_hidden` NCCL AllGather 通信量与每块 152 MB 动态分配 | **Yes** |
+| **P9** | **修复 GDN `causal_conv1d_fn` 切片视图步幅退化（16KB 跨步 -> 连续步幅）** | `causal_conv1d.py` | 36 层 GDN Prefill `causal_conv1d` 恢复 100% 合并访存 | **Yes** |
+| **P10** | **HyperConnection 最终层 `_mtp_hidden_buffer` 原地写入** | `nvidia/model.py`, `hyperconnection.py`, `ops/hc.py` | 消除每个块 `[T, 10240]` 的 160 MB 冗余 `copy_()` | **Yes** |
+| **P11** | **QSA DCP2 `valid_counts` 动态有效长度透传裁剪无效 Split-K 循环** | `nvidia/qsa.py`, `ops/qsa_dcp.py`, `ops/qsa.py` | `TP4 + DCP2` 下 12 层 QSA 跳过 50%+ 空填充 Tile | **Yes** |
+| **P12** | **MTP 启用 SM70 Peer-Copy `hcx` 路径与 GDN 尾部拷贝扩展至 `rows > 1`** | `nvidia/model.py`, `nvidia/mtp.py`, `qwen_gdn_linear_attn.py` | 激活 MTP 层 P2P IPC 融合，消除 `M=10/15/20` GDN 6 次独立 `contiguous()` | **Yes** |
+| **P13** | **PLE 行主序 4-tap Triton Prefill 短卷积 + 状态更新与 `m > 32` N-gram CUDA 扩展** | `ple_layer.py`, `qwen38_ple_spec_sm70.cu` | 消除 49 层 PLE Prefill `transpose + conv1d + transpose`（每层省 ~320 MB 显存流量）与 `m > 32` 500+ 个小算子 | **Yes** |
+
+### 3.2 `TP4 + DCP2` Decode、`MTP4` 与 `DP2 × TP4` 优化及修复（`D1`–`D29`）
+
+| 编号 | 优化/修复名称 | 涉及文件 | 核心收益 | Bit-Exact |
+|---|---|---|---|---|
+| **D1** | **DCP2 All-to-All LSE 解包合并 + FP16 舍入 + Sigmoid 输出门控单内核融合** | `dcp_alltoall.py`, `nvidia/qsa.py` | 12 层 QSA 每步省去 24 个内核启动与 2 次 `[B, 6, 256]` 显存往返 | **Yes** |
+| **D2** | **DCP2 `_localize_indices` 半宽输出，消除每层冗余 `[-1]` 填充写** | `ops/qsa_dcp.py`, `nvidia/qsa.py` | 12 层 QSA 索引局部化写带宽减半 | **Yes** |
+| **D3** | **QSA Split-K 持久工作区缓存（`_qsa_splitk_workspace`）** | `ops/qsa.py` | 消除每步 24 次 FP32 Split-K 张量动态分配 | **Yes** |
+| **D4** | **DCP2 下跳过 `forward_qsa` 冗余 `output.zero_()`** | `nvidia/qsa.py` | 12 层 QSA 省去 12 次 `aten::zero_` 内核 | **Yes** |
+| **D5** | **MTP Draft QSA 块表向量化展开（消除 Python `for` 循环）** | `nvidia/qsa.py` | 4 步 MTP Draft 省去多余 `mul_`/`add_` 启动 | **Yes** |
+| **D6** | **GDN Decode 延迟计算 `compute_num_computed_tokens()`** | `gdn_attn.py` | 每步（Target + 4 Draft）省去 5 次冗余 `aten::sub` 内核 | **Yes** |
+| **D7** | **QSA Indexer / Selector / Shared-Key 持久工作区复用** | `indexer_qsa.py`, `ops/qsa.py`, `ops/qsa_shared_key.py` | 消除每步 48 次动态张量分配 | **Yes** |
+| **D8** | **DCP2 Query 零分配/零拷贝 `all_gather_into_tensor`** | `nvidia/qsa.py` | `B == 1` 零拷贝视图，`B > 1` 零动态分配 | **Yes** |
+| **D9** | **QSA Indexer 动态有效 `score_columns` 边界与 Split-K 空 Tile 短路** | `qsa_cache.py`, `ops/qsa.py` | 短/中上下文下跳过对 256K 空置尾部的无效扫描 | **Yes** |
+| **D10** | **DCP2 `_localize_indices` 融合页表查找（`RESOLVE_PHYSICAL=True`）** | `ops/qsa_dcp.py`, `ops/qsa.py`, `nvidia/qsa.py` | 省去主稀疏注意力内核每 Tile 64 次页表全局访存 | **Yes** |
+| **D11** | **SM70 `GROUP_SIZE=12`（`TP4 + DCP2`）启用 2-Warp Split-K Partial 内核** | `ops/qsa.py` | 提升 V100 SM 驻留率，降低 12 层 QSA Split-K 延迟 | **Yes** |
+| **D12** | **非 MLA 模型跳过冗余 `get_dcp_local_seq_lens` 与 `prepare_dcp_local_seq_lens`** | `gpu_model_runner.py`, `model_runner.py`, `cudagraph_utils.py` | 消除每步 CPU/GPU 冗余序列长度拷贝与内核 | **Yes** |
+| **D13** | **QSA Split-K Merge 直接输出 DCP2 All-to-All 发送布局（省去 `_dcp_a2a_pack_send`）** | `ops/qsa.py`, `nvidia/qsa.py`, `dcp_alltoall.py` | 12 层 QSA 省去 12 个打包内核与 `[B, 12, 256]` 中间读写 | **Yes** |
+| **D14** | **提前执行 `qsa_prep_sm70_out` 并使异步 `ncclAllGather(query)` 与 Indexer 4 内核重叠** | `nvidia/qsa.py` | 将 12 层 `ncclAllGather` 隐藏在 Indexer 计算阴影下 | **Yes** |
+| **D15** | **PLE Decode 短卷积 2D 网格扩展支持 `num_rows >= 1` 多请求** | `ple_layer.py` | 多请求 Decode 49 层 PLE 合并为 2 个内核 | **Yes** |
+| **D16** | **GDN Decode 输出直写 `core_attn_out` 并跳过冗余 `output.copy_`** | `qwen_gdn_linear_attn.py`, `nvidia/model.py` | 36 层 GDN 每步省去 72 次 `aten::copy_` | **Yes** |
+| **D17** | **DCP2 `valid_counts` 驱动 Split-K 提前退出空 Tile** | `nvidia/qsa.py`, `ops/qsa_dcp.py`, `ops/qsa.py` | `M=5` MTP4 校验步减少 >50% 无效 Split-K 循环 | **Yes** |
+| **D18** | **接入 `index_share_for_mtp_iteration` 并在 `skip_topk=True` 时跳过 `q_norm`/`q_rope`** | `llm_base_proposer.py`, `indexer_qsa.py`, `ops/qsa_pre_indexer.py` | MTP Steps 1–3 跳过 QSA Indexer 打分/选块及 Query 归一化旋转 | **Yes** |
+| **D19** | **MTP 启用 Peer-Copy + GDN 拆分扩展 + QSA KV Unbind 缓存** | `nvidia/model.py`, `nvidia/mtp.py`, `nvidia/qsa.py`, `qwen_gdn_linear_attn.py` | 减少 MTP Decode 通信与每层 Python/CUDA 开销 | **Yes** |
+| **D20** | **PLE 多请求投机验证短卷积扩展与 `m > 32` N-gram CUDA 路由** | `ple_layer.py`, `qwen38_ple_spec_sm70.cu` | `num_reqs > 1`（如 `M=10/15/20`）下 48 层 PLE 400+ 内核压至 48 个 | **Yes** |
+| **D21** | **修复 Target 与 MTP Draft 共用 `"final"` / `"hcx:target"` 键导致的 HCX 覆盖 Bug** | `nvidia/model.py` | 确保 Target `layers.47` 与 Draft `layers.48` 同时保有各自 HCX MoE 融合路径 | **Yes** |
+| **D22** | **MTP Steps 1–3 `index_qk_proj` Key-Only 切片 GEMV（省 80% 算力）与短上下文 `IDENTITY_BLOCKS` 快路径** | `indexer_qsa.py`, `sm70_fp16_gemv.py`, `ops/qsa.py` | MTP Steps 1–3 Indexer 投影矩阵从 `640×2560` 缩至 `128×2560`；`seq_len <= 2048` 跳过打分与 Top-K | **Yes** |
+| **D23** | **49 层 MoE `shared_expert.down_proj`（`(2560, 160)`）接入专用 SM70 FP16 GEMV 计划** | `sm70_fp16_gemv.py` | 填补每步 52 层 `shared_expert.down_proj` 的 cuBLAS/Custom-Op 回退空白 | **Yes** |
+| **D24** | **MTP `fc_embedding + fc_hidden` 单内核融合 `_qwen38_mtp_fc_fused_gemv_add_kernel`** | `sm70_mtp_fc.py` | 消除 4 步 MTP Draft 中 `[M, 4, 2560]` 跨分支权重重复加载与加法内核 | **Yes** |
+| **D25** | **MTP `compact_topk_indices` 单行 Triton 原地压缩与 `_determine_batch_execution_and_padding` 复用** | `nvidia/mtp.py`, `llm_base_proposer.py` | 消除 `index_select + copy_` 分配及 `dummy_run` 冗余开销 | **Yes** |
+| **D26** | **`DP2 × TP4 + DCP2 + MTP4` 局部 MoE `tp_size=4` 保持与跨 DP 异步执行修复** | `qwen3_next.py`, `dp_utils.py`, `llm_base_proposer.py`, `gpu_model_runner.py` | 解决 `8 × V100` 下 `flatten_tp_size=8` 报错与跨 DP 投机步死锁 | **Yes** |
+| **D27** | **MTP `_make_draft_vllm_config` 正确继承 `speculative_config.kv_cache_dtype`** | `nvidia/mtp.py`, `amd/mtp.py` | 修复 `--kv-cache-dtype fp8_e4m3` 时草稿层误用 `fp8_e4m3` 导致的 `Loaded 0/2` 报错 | **Yes** |
+| **D28** | **QSA 草稿块表 `torch.mul(table.unsqueeze(-1).expand(...), expansion, out=expanded_view)` 修复** | `nvidia/qsa.py` | 修复 PyTorch `out=` 不做广播导致的 `expanded_view` 静默缩容与 `.view(1, 1, 2)` 崩溃 | **Yes** |
+| **D29** | **MTP `dcp_partial_output_buffer` 头维/FP32 修复 + CUDA Graph 捕获私有内存池安全隔离 + Triton 0D 标量修复 + 多模态 MRoPE 保护** | `nvidia/mtp.py`, `nvidia/qsa.py`, `indexer_qsa.py`, `dcp_alltoall.py`, `ple_layer.py`, `llm_base_proposer.py`, `qwen_gdn_linear_attn.py` | 修复 `QSA DCP partial output has wrong head geometry`、Triton `tl.zeros([])` 编译报错、CUDA Graph 捕获池跨图释放及多模态 Prefill 3D MRoPE 保护 | **Yes** |
 
 ---
 
-### 3.2 `TP4 + DCP2` Decode、`MTP4` 与 `DP2 × TP4` 优化（`D1`–`D27`）
-
-| 编号 | 阶段 | 涉及文件 | 优化内容与精确收益 |
-| :--- | :--- | :--- | :--- |
-| **`D1`** | 阶段一 | `dcp_alltoall.py`, `nvidia/qsa.py` | 将 DCP All-to-All LSE 解包/合并 + FP16 舍入 + Sigmoid 输出门控直接融合写入 `output` |
-| **`D2`** | 阶段一 | `ops/qsa_dcp.py`, `ops/qsa.py`, `nvidia/qsa.py` | 将 `_qsa_localize_dcp_indices_kernel` 输出存储宽度减半（`1026` vs `2051`） |
-| **`D3`** | 阶段一 | `ops/qsa.py` | 预分配并按 1D 连续视图复用 Split-K `partial_out` / `partial_lse` 工作区 |
-| **`D4`** | 阶段一 | `nvidia/qsa.py` | 在 DCP QSA Decode 路径跳过冗余的 `output.zero_()` |
-| **`D5`** | 阶段一 | `gdn_attn.py` | 向量化展开复制草稿块表（replicated-draft block-table expansion） |
-| **`D6`** | 阶段一 | `gdn_attn.py` | 在 Decode 阶段跨 6 个 GDN 组延迟计算 `compute_num_computed_tokens()` |
-| **`D7`** | 阶段一 | `ops/qsa.py`, `ops/qsa_shared_key.py`, `indexer_qsa.py` | 为 Selector、Shared-Key 与 Indexer 提供持久工作区，每步 Decode 消除 90+ 次动态 GPU 分配 |
-| **`D8`** | 阶段一 | `nvidia/qsa.py` | 复用持久化的 DCP `all_gather` 查询接收工作区 |
-| **`D9`** | 阶段一 | `qsa_cache.py`, `indexer_qsa.py`, `ops/qsa.py` | Decode 阶段按实际存活上下文长度动态收缩 `score_columns`（削减 80%~98% 空打分 CTA），并在 Split-K 内核中加入空块短路（`tl.max(logical_token, axis=0) >= 0`） |
-| **`D10`** | 阶段一 | `ops/qsa_dcp.py`, `ops/qsa.py`, `nvidia/qsa.py` | 在 `_qsa_localize_dcp_indices_kernel` 内直接融合解析物理 KV 槽位（`RESOLVE_PHYSICAL=True`） |
-| **`D11`** | 阶段一 | `ops/qsa.py` | 针对 `DCP2`（`group_size == 12`）启用 2-warp SM70 轻量级部分归约启动配置 |
-| **`D12`** | 阶段一 | `gpu_model_runner.py`, `model_runner.py`, `cudagraph_utils.py` | 仅对 MLA 模型准备 `dcp_local_seq_lens`，跳过 QSA 模型上的冗余元数据构造 |
-| **`D13`** | 阶段一 | `ops/qsa.py`, `dcp_alltoall.py`, `nvidia/qsa.py` | 将 Split-K 合并与 DCP All-to-All 发送缓冲打包融合（`dcp_packed_out`），每步省去 12 次 `_dcp_a2a_pack_send_kernel` 启动 |
-| **`D14`** | 阶段一 | `nvidia/qsa.py` | 将 `qsa_prep_sm70_out` 与异步 `all_gather_into_tensor(query, async_op=True)` 提前，与全部 4 个 Indexer 算子及 `qsa_localize_dcp_indices` 并行重叠 |
-| **`D15`** | 阶段一 | `ple_layer.py` | 将 `_qwen38_ple_m1_short_conv_kernel` 扩展为 2D 网格 `(cdiv(10240, 256), num_rows)`，原生支持 MTP4 验证阶段 `M = 5` 并消除 `zeros_like` |
-| **`D16`** | 阶段一 | `model.py`, `qwen_gdn_linear_attn.py` | 消除 `output_projection` 关闭时的冗余 `attn_buffer` 分配/拷贝，缓存空元数据张量，使 `mixed_qkv_recurrence` 直接写入 `core_attn_out`，并启用 `qwen38_sm70_fp16_gdn_input` |
-| **`D17`** | 阶段二 | `ops/qsa_dcp.py`, `ops/qsa.py`, `nvidia/qsa.py` | `TP4 + DCP2` 下利用 `valid_counts` 在 Decode 阶段跳过空 Owner 分片与 `-1` 尾部块 |
-| **`D18`** | 阶段二 | `llm_base_proposer.py`, `indexer_qsa.py`, `ops/qsa_pre_indexer.py` | 在 V1 `SpecDecodeBaseProposer` 中接入 `index_share_for_mtp_iteration`（`set_skip_topk` + `compact_topk_indices`），并在 `skip_topk or not select` 时跳过 `q_norm` 与 `q_rope`（`num_q_work = 0`） |
-| **`D19`** | 阶段二 | `model.py`, `mtp.py`, `qsa.py`, `qwen_gdn_linear_attn.py` | MTP 启用 SM70 Peer 路径、融合 GDN 投影尾部拷贝并扩展 `qsa_prep_sm70_out` |
-| **`D20`** | 阶段二 | `ple_layer.py`, `qwen38_ple_spec_sm70.cu` | 支持多请求（`1 <= num_reqs <= 64`）MTP4 PLE 投机短卷积（每步从 112 次启动降至 8 次）并兼容 FP16/FP32 `conv_state` |
-| **`D21`** | 阶段二 | `model.py` | 修复 `Qwen4ExpModel`（`"final"`）与 `Qwen4ExpMultiTokenPredictor`（`"mtp.final"`）在 `enable_sm70_hcx` 注册表中的命名冲突 |
-| **`D22`** | 阶段二 | `indexer_qsa.py`, `ops/qsa.py`, `sm70_fp16_gemv.py` | 当 `skip_query_prep` 为真时对 `index_qk_proj` 执行 Key-only 切片投影（`weight[512:]`，`[128, 2560]` vs `[640, 2560]`，计算与权重带宽减 **80%**），并在 `max_seq_len <= 2051` 时启用 `IDENTITY_BLOCKS=True` 恒等块展开（每轮省 **26 次算子启动**） |
-| **`D23`** | 阶段二 | `sm70_fp16_gemv.py` | 为 `.mlp.shared_expert.down_proj`（`(2560, 160)`）添加专用 `_GemvPlan(256, 2, 0)`，每轮 `M = 1` 消除 52 次通用 cuBLAS 回退 |
-| **`D24`** | 阶段二 | `sm70_mtp_fc.py` | 将 MTP Draft 的 `fc_embedding`、`fc_hidden`（4 路 HC）与逐元素相加融合为单个 Triton 内核 `_qwen38_mtp_fc_fused_gemv_add_kernel`，严格保留两次 FP16 舍入边界，每轮省 **8 次算子启动** |
-| **`D25`** | 阶段二 | `mtp.py` | 对 `compact_topk_indices` 共享缓冲去重，为 `B = 1` Decode 新增单行原地 Triton 内核 `_compact_topk_single_row_kernel`，并为 `B > 1` 缓存持久 `_compact_topk_scratch` |
-| **`D26`** | 阶段三 | `qwen3_next.py`, `llm_base_proposer.py`, `gpu_model_runner.py`, `dp_utils.py`, `test_weight_loading.py` | 完整修复 `8 × V100` 下 `DP2 × TP4 + DCP2 + MTP4` 启动崩溃与跨 DP 同步挂起问题 |
-| **`D27`** | 阶段三 | `nvidia/mtp.py`, `amd/mtp.py`, `test_e4m3_mtp.py` | 修复 `_make_draft_vllm_config()` 漏传 `speculative_config.kv_cache_dtype` 导致草稿层误继承主模型 `fp8_e4m3` 并触发 `_finalize_qsa_e4m3_scale_load` 报 `Loaded 0/2` 拒绝启动的问题 |
-
----
-
-## 4. 生产级最佳启动脚本汇总（256K + 多模态 + 工具调用 + MTP4）
+## 4. 生产级最佳启动脚本汇总（256K + 多模态 + 工具调用 + MTP4 + `fp8_e4m3`）
 
 ### 4.1 `4 × V100 32GB` 启动脚本（`TP4 + DCP2 + MTP4 + fp8_e4m3`）
-适用于 4 张 V100 32GB，开启 **256K 上下文、多模态、工具调用、MTP4 投机解码、以及主模型 `fp8_e4m3` + MTP 草稿 `float16` KV Cache**：
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next-NVFP4}"
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# ==============================================================================
-# 关键配置：关闭默认 Disk-Mmap PLE，使用 Pinned-Host UVA 内存直读
-# 4 个 GPU Worker 进程各分配 12 GiB Pinned Host RAM（主机共占用 ~48 GiB RAM）
-# ==============================================================================
-export VLLM_PLE_CPU_OFFLOAD=0
-export VLLM_PLE_DISK_OFFLOAD=0
-export VLLM_SM70_QWEN38_HYBRID_PLE=0
-export VLLM_QWEN4EXP_PLE_HOST_GIB="${VLLM_QWEN4EXP_PLE_HOST_GIB:-12}"
+# SM70 QSA Prefill & Decode 核心加速开关
+export VLLM_SM70_QSA_INDEXER_CUBLAS=1
+export VLLM_SM70_QSA_CUBLAS_MIN_ROWS=64
+export VLLM_SM70_QSA_SCORE_TILE_MB=32
+export VLLM_SM70_QSA_GROUPED_PAGE4=1
+export VLLM_SM70_QSA_GROUPED_PAD_FIX=1
+export VLLM_SM70_QSA_MTP_TOPK=1
 
-# （可选：若主机空闲内存 < 64 GiB，请注释上面 4 行并启用下面 5 行，总计仅占 ~14.3 GiB RAM）
-# export VLLM_SM70_QWEN38_HYBRID_PLE=1
-# export VLLM_PLE_CPU_OFFLOAD=1
-# export VLLM_PLE_DISK_OFFLOAD=0
-# export VLLM_PLE_OFFLOAD_PREFAULT=1
-# export VLLM_QWEN4EXP_PLE_HOST_GIB=4
+# SM70 PLE Speculative Short-Conv & TurboMind NVFP4 MoE 核心加速开关
+export VLLM_SM70_PLE_SPEC_CONV=1
+export VLLM_SM70_TURBOMIND_MOE_COMPACT_SHARED=1
+export VLLM_SM70_TURBOMIND_MOE_FUSED_PREP=1
+export VLLM_SM70_TURBOMIND_MOE_SMALL_UNROUTE=1
 
-exec vllm serve "${MODEL_PATH}" \
-  --served-model-name Qwen3.8-Flash-Next \
+vllm serve "${MODEL_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
+  --dtype float16 \
+  --kv-cache-dtype fp8_e4m3 \
   --tensor-parallel-size 4 \
   --decode-context-parallel-size 2 \
-  --dtype half \
-  --kv-cache-dtype fp8_e4m3 \
+  --dcp-comm-backend a2a \
+  --cp-kv-cache-interleave-size 64 \
+  --block-size 800 \
   --max-model-len 262144 \
-  --max-num-batched-tokens 8192 \
-  --max-num-seqs 4 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 16384 \
   --gpu-memory-utilization 0.90 \
-  --no-async-scheduling \
-  --mamba-cache-mode align \
   --enable-prefix-caching \
-  --no-language-model-only \
-  --limit-mm-per-prompt '{"image":4,"video":0}' \
+  --enable-chunked-prefill \
+  --async-scheduling \
+  --limit-mm-per-prompt '{"image":5,"video":2}' \
+  --mm-encoder-tp-mode data \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":false}' \
-  --kernel-config '{"ple_disk_cascade":false}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}' \
-  --seed 0
+  --kernel-config '{
+    "sm70_hcx": true,
+    "sm70_hcx_moe_allreduce": true,
+    "sm70_hcx_output_projection": true,
+    "sm70_fp16_gemv": true,
+    "sm70_fp16_fused_hc": true,
+    "sm70_mtp_fc_combine": true,
+    "sm70_qsa_prep": true,
+    "sm70_qsa_side_fusion": true,
+    "sm70_qsa_shared_key": true,
+    "qsa_dense_short_context": true
+  }' \
+  --compilation-config '{
+    "mode": 3,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "cudagraph_capture_sizes": [1, 2, 4, 8]
+  }'
 ```
 
----
-
 ### 4.2 `8 × V100 32GB` 单入口 `DP2 × TP4 + DCP2 + MTP4 + fp8_e4m3` 启动脚本
-适用于在本分支（或打上第 5 节补丁后）用 8 张 V100 启动单入口 `DP2 × TP4 + DCP2 + MTP4` 服务：
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next-NVFP4}"
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 方案 A（主机内存 >= 96 GiB 推荐）：8 个进程各分配 10 GiB Pinned Host RAM（共 ~80 GiB）
-export VLLM_PLE_CPU_OFFLOAD=0
-export VLLM_PLE_DISK_OFFLOAD=0
-export VLLM_SM70_QWEN38_HYBRID_PLE=0
-export VLLM_QWEN4EXP_PLE_HOST_GIB="${VLLM_QWEN4EXP_PLE_HOST_GIB:-10}"
+# SM70 QSA Prefill & Decode 核心加速开关
+export VLLM_SM70_QSA_INDEXER_CUBLAS=1
+export VLLM_SM70_QSA_CUBLAS_MIN_ROWS=64
+export VLLM_SM70_QSA_SCORE_TILE_MB=32
+export VLLM_SM70_QSA_GROUPED_PAGE4=1
+export VLLM_SM70_QSA_GROUPED_PAD_FIX=1
+export VLLM_SM70_QSA_MTP_TOPK=1
 
-# 方案 B（主机内存 < 96 GiB 时替代方案 A）：8 卡共享单份 ~14.3 GiB PLE 内存池
-# export VLLM_SM70_QWEN38_HYBRID_PLE=1
-# export VLLM_PLE_CPU_OFFLOAD=1
-# export VLLM_PLE_DISK_OFFLOAD=0
-# export VLLM_PLE_OFFLOAD_PREFAULT=1
-# export VLLM_QWEN4EXP_PLE_HOST_GIB=4
+# SM70 PLE Speculative Short-Conv & TurboMind NVFP4 MoE 核心加速开关
+export VLLM_SM70_PLE_SPEC_CONV=1
+export VLLM_SM70_TURBOMIND_MOE_COMPACT_SHARED=1
+export VLLM_SM70_TURBOMIND_MOE_FUSED_PREP=1
+export VLLM_SM70_TURBOMIND_MOE_SMALL_UNROUTE=1
 
-exec vllm serve "${MODEL_PATH}" \
-  --served-model-name Qwen3.8-Flash-Next \
+vllm serve "${MODEL_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
+  --dtype float16 \
+  --kv-cache-dtype fp8_e4m3 \
   --data-parallel-size 2 \
   --tensor-parallel-size 4 \
   --decode-context-parallel-size 2 \
-  --dtype half \
-  --kv-cache-dtype fp8_e4m3 \
+  --dcp-comm-backend a2a \
+  --cp-kv-cache-interleave-size 64 \
+  --block-size 800 \
   --max-model-len 262144 \
-  --max-num-batched-tokens 8192 \
-  --max-num-seqs 4 \
-  --gpu-memory-utilization 0.90 \
-  --no-async-scheduling \
-  --mamba-cache-mode align \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.92 \
   --enable-prefix-caching \
-  --no-language-model-only \
-  --limit-mm-per-prompt '{"image":4,"video":0}' \
+  --enable-chunked-prefill \
+  --async-scheduling \
+  --limit-mm-per-prompt '{"image":5,"video":2}' \
+  --mm-encoder-tp-mode data \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":false}' \
-  --kernel-config '{"ple_disk_cascade":false}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}' \
-  --seed 0
+  --kernel-config '{
+    "sm70_hcx": true,
+    "sm70_hcx_moe_allreduce": true,
+    "sm70_hcx_output_projection": true,
+    "sm70_fp16_gemv": true,
+    "sm70_fp16_fused_hc": true,
+    "sm70_mtp_fc_combine": true,
+    "sm70_qsa_prep": true,
+    "sm70_qsa_side_fusion": true,
+    "sm70_qsa_shared_key": true,
+    "qsa_dense_short_context": true
+  }' \
+  --compilation-config '{
+    "mode": 3,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "cudagraph_capture_sizes": [1, 2, 4, 8, 16]
+  }'
 ```
 
 ---
 
 ## 5. 相对于 `main` 分支（`be3722bc09`）的全量代码修改合并 Diff（共 31 个文件）
 
-以下为本分支所有源码与测试文件相对于 `main` 分支基线（`be3722bc095b9792bf9833068595f0b1ef70ad37`）的**最终合并版 Unified Diff**（已将阶段一 `P1`–`P10`/`D1`–`D16`、阶段二 `P11`–`P13`/`D17`–`D25`、阶段三 `D26`–`D27` 在同一文件上的修改全部合入一处）：
+> **重要说明**：下方 31 个代码块直接由当前分支工作区相对于 `main`（`be3722bc095b9792bf9833068595f0b1ef70ad37`）的 `git diff` 自动生成，所有同一文件的多阶段修改（`P1`–`P13` + `D1`–`D29`）均已合并为**单文件单块最终 Diff**，不含任何中间态冲突。
 
 ### 5.1 `csrc/sm70_turbomind/ops/qwen38_ple_spec_sm70.cu` — CUDA 内核：SM70 PLE 多请求 MTP4 投机 Dilated Short-Conv 融合内核（P13 / D20）
 
@@ -395,8 +394,6 @@ index a678cd2..20caa3d 100644
    } else {
 ```
 
----
-
 ### 5.2 `vllm/model_executor/layers/fused_moe/sm70/fp4_workspace.py` — SM70 NVFP4 MoE 工作区缓存只读序列索引与跳过冗余清零（P3, P4）
 
 ```diff
@@ -462,9 +459,8 @@ index 15b070d..5f397a2 100644
 +            "compact_offsets": arange_buf[: slots + 1],
              "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
          }
+ 
 ```
-
----
 
 ### 5.3 `vllm/model_executor/layers/layernorm.py` — RMSNormGated 启用 MTP4 时大行数（rows > 192）@torch.compile 融合快路径（P6）
 
@@ -533,13 +529,11 @@ index 8affdf0..bd79bf2 100644
      Layer Normalization.
 ```
 
----
-
 ### 5.4 `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` — GDN 投影拆分网格缩减（P5）、尾部拷贝融合（P12 / D19）与 Decode 零拷贝（D16）
 
 ```diff
 diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-index a82ba15..8438479 100644
+index a82ba15..57dddf0 100644
 --- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 @@ -789,28 +789,43 @@ def _qwen_gdn_metadata_tensors(
@@ -672,12 +666,13 @@ index a82ba15..8438479 100644
          and attn_metadata.spec_sequence_masks is None
          and attn_metadata.num_prefills == 0
          and attn_metadata.num_decodes > 0
-@@ -5795,6 +5829,24 @@ def qwen_gdn_input_projection_core(
+@@ -5795,6 +5829,25 @@ def qwen_gdn_input_projection_core(
              "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
          )
          z = z_out
 +    elif (
 +        getattr(self, "sm70_qwen38_fp16_fused_input", False)
++        and hidden_states.shape[0] in (1, 5, 10)
 +        and isinstance(self.in_proj_qkvz, LinearBase)
 +        and isinstance(self.in_proj_ba, LinearBase)
 +        and use_sm70_decode_graph_semantics(
@@ -697,7 +692,7 @@ index a82ba15..8438479 100644
      else:
          mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
          ba, _ = self.in_proj_ba(hidden_states)
-@@ -5813,7 +5865,7 @@ def qwen_gdn_input_projection_core(
+@@ -5813,7 +5866,7 @@ def qwen_gdn_input_projection_core(
          copied_tails = (
              not self.gqa_interleaved_layout
              and not self.disable_tp_for_ba_proj
@@ -706,7 +701,7 @@ index a82ba15..8438479 100644
              and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
              and self.value_dim // self.tp_size == 1536
              and z_out.shape == (mixed_qkvz.shape[0], 12, 128)
-@@ -5951,6 +6003,46 @@ def qwen_gdn_input_projection(
+@@ -5951,6 +6004,46 @@ def qwen_gdn_input_projection(
      assert self.in_proj_ba is not None
      ba, _ = self.in_proj_ba(hidden_states)
  
@@ -755,8 +750,6 @@ index a82ba15..8438479 100644
              mixed_qkvz,
 ```
 
----
-
 ### 5.5 `vllm/model_executor/layers/mamba/ops/causal_conv1d.py` — GDN causal_conv1d 保持切片视图 channel-last 连续步幅，消除 16KB 跨步非合并访存（P9）
 
 ```diff
@@ -790,8 +783,6 @@ index 4ea8e28..b82f4fd 100644
      np2_statelen = triton.next_power_of_2(state_len)
 ```
 
----
-
 ### 5.6 `vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py` — NVFP4 MoE expert_map=None 快路径跳过冗余清零与拷贝（P3, P4）
 
 ```diff
@@ -819,8 +810,6 @@ index 2a39f1e..c2edaaf 100644
                  self.native_ops.moe_permute_metadata_with_scratch(
                      x,
 ```
-
----
 
 ### 5.7 `vllm/model_executor/models/qwen3_next.py` — DP2 × TP4 下保持 FusedMoE 副本内局部 TP=4（不跨 DP 扁平化为 TP=8）（D26）
 
@@ -851,8 +840,6 @@ index 093f5ce..367a3ed 100644
              enable_eplb=self.enable_eplb,
              num_redundant_experts=self.n_redundant_experts,
 ```
-
----
 
 ### 5.8 `vllm/models/qwen4_exp/amd/mtp.py` — AMD MTP _make_draft_vllm_config 正确继承 speculative_config.kv_cache_dtype（D27）
 
@@ -899,8 +886,6 @@ index 2c93808..a6aaa33 100644
      # VllmConfig post-init derives the target quant config, so restore the
      # independently resolved draft quant config after replacement.
 ```
-
----
 
 ### 5.9 `vllm/models/qwen4_exp/common/qsa_cache.py` — QSA 跨层 visible_blocks_cache（P1）与 Decode 动态有效 score_columns 边界（D9）
 
@@ -960,9 +945,9 @@ index f087d0b..b33e090 100644
              query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
 +            max_seq_len=max_seq_len,
          )
+ 
+ 
 ```
-
----
 
 ### 5.10 `vllm/models/qwen4_exp/nvidia/hyperconnection.py` — HyperConnection _hcx_final_mix 原地写入 _mtp_hidden_buffer（P10）
 
@@ -999,16 +984,28 @@ index 6d059d3..3532748 100644
          block_input, injection = self._project(xn)
 ```
 
----
-
-### 5.11 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` — QSA Indexer 持久工作区（D7）、skip_topk 跳过 q_norm/q_rope（D18）与 Key-only 切片投影（D22）
+### 5.11 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` — QSA Indexer 图捕获安全持久工作区（D7, D29）、skip_topk 跳过 q_norm/q_rope（D18）与 Key-only 切片投影（D22）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-index 0369fac..8d31702 100644
+index 0369fac..b026a79 100644
 --- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-@@ -166,6 +166,28 @@ class QSAIndexer(nn.Module):
+@@ -25,8 +25,13 @@ from ..common.qsa_cache import (
+     QSAKeyStateCache,
+     canonical_qsa_rope_positions,
+ )
++from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
+ from .ops.qsa_pre_indexer import qsa_pre_indexer
+ 
++_SM70_QSA_INDEXER_Q_WORKSPACES: dict[
++    tuple[int, int, torch.dtype], tuple[int, torch.Tensor]
++] = {}
++
+ 
+ def apply_qsa_rope(
+     rotary_emb: nn.Module,
+@@ -166,6 +171,48 @@ class QSAIndexer(nn.Module):
              cache_config=cache_config,
              vllm_config=vllm_config,
          )
@@ -1021,6 +1018,26 @@ index 0369fac..8d31702 100644
 +        device: torch.device,
 +    ) -> torch.Tensor:
 +        needed = num_tokens * self.index_n_heads * self.index_head_dim
++        if device.type == "cuda":
++            device_index = device.index if device.index is not None else -1
++            stream_id = int(torch.cuda.current_stream(device).cuda_stream)
++            ws_key = (device_index, stream_id, dtype)
++            ws_cache = workspace_cache(
++                "qsa_indexer_q", _SM70_QSA_INDEXER_Q_WORKSPACES
++            )
++            workspace = ws_cache.get(ws_key)
++            if workspace is None or workspace[0] < needed:
++                cap = 1 << (max(needed, 1) - 1).bit_length()
++                if workspace is not None:
++                    cap = max(cap, workspace[0])
++                buf = torch.empty((cap,), dtype=dtype, device=device)
++                workspace = (cap, buf)
++                ws_cache[ws_key] = workspace
++            retain_for_capture(ws_cache, workspace, workspace[1])
++            buf = workspace[1]
++            return buf[:needed].view(
++                num_tokens, self.index_n_heads, self.index_head_dim
++            )
 +        buf = self._q_buffer
 +        if (
 +            buf is None
@@ -1037,7 +1054,7 @@ index 0369fac..8d31702 100644
  
      @property
      def output_width(self) -> int:
-@@ -220,7 +242,11 @@ class QSAIndexer(nn.Module):
+@@ -220,7 +267,11 @@ class QSAIndexer(nn.Module):
                  return out
              return result
  
@@ -1049,7 +1066,7 @@ index 0369fac..8d31702 100644
              qsa_compress_groups_with_ratio,
              qsa_select_paged_tokens,
              qsa_store_cache_rows,
-@@ -231,30 +257,84 @@ class QSAIndexer(nn.Module):
+@@ -231,30 +282,84 @@ class QSAIndexer(nn.Module):
          hidden_states = hidden_states[:num_tokens]
          positions = positions[..., :num_tokens]
  
@@ -1149,7 +1166,7 @@ index 0369fac..8d31702 100644
                  raw_keys,
                  positions,
                  self.rotary_emb.cos_sin_cache,
-@@ -277,18 +357,20 @@ class QSAIndexer(nn.Module):
+@@ -277,18 +382,20 @@ class QSAIndexer(nn.Module):
                      if raw_key_state_cache.rope_position_cache is not None
                      else None
                  ),
@@ -1177,16 +1194,16 @@ index 0369fac..8d31702 100644
  
              raw_key_cache = raw_key_state_cache.key_cache
              rope_position_cache = raw_key_state_cache.rope_position_cache
-@@ -361,6 +443,8 @@ class QSAIndexer(nn.Module):
+@@ -361,6 +468,8 @@ class QSAIndexer(nn.Module):
              out,
              query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
              shared_key_scoring=self.shared_key_scoring,
 +            visible_blocks_cache=compressed_metadata.visible_blocks_cache,
 +            max_seq_len=compressed_metadata.max_seq_len,
          )
+ 
+ 
 ```
-
----
 
 ### 5.12 `vllm/models/qwen4_exp/nvidia/model.py` — HC 原地写回（P10）、GDN 免拷贝（D16）、MTP 启用 SM70 Peer 路径（P12 / D19）与修复 hcx final 命名冲突（D21）
 
@@ -1272,13 +1289,11 @@ index 2a0ce19..de372a3 100644
              # this tensor is needed by the final mixer regardless).
 ```
 
----
-
-### 5.13 `vllm/models/qwen4_exp/nvidia/mtp.py` — MTP 预分配 topk/DCP2 缓冲（P8）、启用 Peer 路径（P12 / D19）、compact_topk_indices 单行 Triton 核（D25）与修复草稿 kv_cache_dtype 继承（D27）
+### 5.13 `vllm/models/qwen4_exp/nvidia/mtp.py` — MTP 预分配 topk/DCP2 缓冲与 head 几何/FP32 修复（P8, D29）、启用 Peer 路径（P12 / D19）、compact_topk_indices 单行 Triton 核与图安全暂存（D25, D29）及草稿 kv_cache_dtype 继承（D27）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
-index 05b7ce3..0eda2a9 100644
+index 05b7ce3..8fa021b 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
 +++ b/vllm/models/qwen4_exp/nvidia/mtp.py
 @@ -14,6 +14,9 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
@@ -1291,15 +1306,18 @@ index 05b7ce3..0eda2a9 100644
  
  import regex as re
  import torch
-@@ -73,10 +76,28 @@ from .model import (
+@@ -73,9 +76,30 @@ from .model import (
  )
  from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
  from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 +from vllm.triton_utils import HAS_TRITON, tl, triton
++from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
  
  logger = init_logger(__name__)
  
- 
++_SM70_MTP_COMPACT_TOPK_WORKSPACES: dict[tuple[int, int, int], torch.Tensor] = {}
++
++
 +@triton.jit
 +def _compact_topk_single_row_kernel(
 +    buffer_ptr,
@@ -1316,11 +1334,10 @@ index 05b7ce3..0eda2a9 100644
 +    vals = tl.load(buffer_ptr + src_row * stride_row + cols, mask=mask)
 +    tl.store(buffer_ptr + cols, vals, mask=mask)
 +
-+
+ 
  def _remap_ignored_layers(
      ignored_layers: list[str],
-     mtp_start_layer_idx: int,
-@@ -223,10 +244,26 @@ def _make_draft_vllm_config(
+@@ -223,10 +247,26 @@ def _make_draft_vllm_config(
                  _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
              )
  
@@ -1349,7 +1366,7 @@ index 05b7ce3..0eda2a9 100644
      )
      # VllmConfig post-init derives the target quant config, so restore the
      # independently resolved draft quant config after replacement.
-@@ -310,6 +347,50 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -310,6 +350,52 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
          # Phase 2: the drafter shares the target cache_config; remember the main
          # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
          self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
@@ -1370,7 +1387,9 @@ index 05b7ce3..0eda2a9 100644
 +            self.topk_indices_buffer = topk_indices_buffer
 +            if draft_vllm_config.parallel_config.decode_context_parallel_size == 2:
 +                tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
-+                local_q_heads = int(config.num_attention_heads) // max(tp_size, 1)
++                gathered_heads = (
++                    int(config.num_attention_heads) // max(tp_size, 1) * 2
++                )
 +                head_dim = int(
 +                    getattr(
 +                        config,
@@ -1385,13 +1404,13 @@ index 05b7ce3..0eda2a9 100644
 +                )
 +                dcp_partial_output_buffer = torch.empty(
 +                    max_tokens,
-+                    local_q_heads,
++                    gathered_heads,
 +                    head_dim,
-+                    dtype=model_config.dtype,
++                    dtype=torch.float32,
 +                )
 +                dcp_partial_lse_buffer = torch.empty(
 +                    max_tokens,
-+                    local_q_heads,
++                    gathered_heads,
 +                    dtype=torch.float32,
 +                )
 +                self.dcp_local_indices_buffer = dcp_local_indices_buffer
@@ -1400,7 +1419,7 @@ index 05b7ce3..0eda2a9 100644
          with set_current_vllm_config(draft_vllm_config, prefix=prefix):
              # residual_linear_shared fusion: fc_embedding projects the token
              # embedding, fc_hidden (shared across HC branches) projects the
-@@ -338,6 +419,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -338,6 +424,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                      draft_vllm_config,
                      layer_type="full_attention",
                      prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
@@ -1411,7 +1430,7 @@ index 05b7ce3..0eda2a9 100644
                  )
                  for idx in range(self.num_mtp_layers)
              )
-@@ -387,10 +472,51 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -387,10 +477,62 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
          """Keep each request's target-aligned step-0 sparse-index row."""
  
          num_rows = row_indices.numel()
@@ -1443,7 +1462,15 @@ index 05b7ce3..0eda2a9 100644
 +                    num_warps=2,
 +                )
 +            elif buffer.device.type == "cuda":
-+                scratch = getattr(self, "_compact_topk_scratch", None)
++                device_index = (
++                    buffer.device.index if buffer.device.index is not None else -1
++                )
++                stream_id = int(torch.cuda.current_stream(buffer.device).cuda_stream)
++                ws_key = (device_index, stream_id, width)
++                ws_cache = workspace_cache(
++                    "qsa_mtp_compact_topk", _SM70_MTP_COMPACT_TOPK_WORKSPACES
++                )
++                scratch = ws_cache.get(ws_key)
 +                if (
 +                    scratch is None
 +                    or scratch.shape[0] < num_rows
@@ -1451,11 +1478,14 @@ index 05b7ce3..0eda2a9 100644
 +                    or scratch.dtype != buffer.dtype
 +                    or scratch.device != buffer.device
 +                ):
-+                    cap = max(num_rows, buffer.shape[0])
++                    cap = 1 << (max(num_rows, 1) - 1).bit_length()
++                    if scratch is not None and scratch.device == buffer.device:
++                        cap = max(cap, scratch.shape[0])
 +                    scratch = torch.empty(
 +                        (cap, width), dtype=buffer.dtype, device=buffer.device
 +                    )
-+                    object.__setattr__(self, "_compact_topk_scratch", scratch)
++                    ws_cache[ws_key] = scratch
++                retain_for_capture(ws_cache, scratch, buffer)
 +                selected = scratch[:num_rows]
 +                torch.index_select(buffer, 0, row_indices, out=selected)
 +                buffer[:num_rows].copy_(selected)
@@ -1465,7 +1495,7 @@ index 05b7ce3..0eda2a9 100644
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
-@@ -713,7 +839,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+@@ -713,7 +855,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
          # Finalize its calibrated k/v scales strictly from the checkpoint (no
          # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
          # and on the PLE offload process (is_offload_process()).
@@ -1477,15 +1507,15 @@ index 05b7ce3..0eda2a9 100644
  
          _finalize_qsa_e4m3_scale_load(
              self,
-@@ -721,6 +850,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+@@ -721,6 +866,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
              self.model._kv_cache_dtype,
              require_calibrated_speculative_draft=True,
          )
 +        _maybe_enable_sm70_peer_paths(self.vllm_config, self.model)
          return loaded_weights
+ 
+ 
 ```
-
----
 
 ### 5.14 `vllm/models/qwen4_exp/nvidia/ops/hc.py` — HyperConnection _hc_combine_norm_impl 支持 out 缓冲原地写回（P10）
 
@@ -1569,13 +1599,11 @@ index c0a8a1d..8668eb1 100644
          block_output,
 ```
 
----
-
 ### 5.15 `vllm/models/qwen4_exp/nvidia/ops/qsa.py` — QSA Split-K/Selector 持久缓冲（D3, D7）、空块短路与 2-warp 启动（D9, D11）、Split-K 融合 DCP 打包（D13）、DCP2 valid_counts 动态裁剪（P11 / D17）与短上下文 IDENTITY_BLOCKS 快路径（D22）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-index aa5e6a6..7d06033 100644
+index aa5e6a6..968e4a2 100644
 --- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
 @@ -70,6 +70,14 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
@@ -2362,10 +2390,11 @@ index aa5e6a6..7d06033 100644
  ) -> torch.Tensor:
      """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
  
-@@ -2414,6 +2700,25 @@ def qsa_sparse_paged_attention(
+@@ -2414,7 +2700,34 @@ def qsa_sparse_paged_attention(
              raise ValueError(
                  "QSA DCP must apply its gate after merging partial outputs"
              )
+-    output_gate_view = output_gate.view_as(q) if output_gate is not None else None
 +    if dcp_packed_out is not None:
 +        if lse is None:
 +            raise ValueError("QSA DCP packed output requires LSE")
@@ -2385,10 +2414,19 @@ index aa5e6a6..7d06033 100644
 +    dcp_h_per_rank = (
 +        dcp_packed_out.shape[2] if dcp_packed_out is not None else q.shape[1]
 +    )
-     output_gate_view = output_gate.view_as(q) if output_gate is not None else None
++    output_gate_view = (
++        None
++        if output_gate is None
++        else (
++            output_gate
++            if output_gate.shape == q.shape
++            else output_gate.reshape(q.shape)
++        )
++    )
      if output_gate_view is not None:
          if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
-@@ -2453,10 +2758,10 @@ def qsa_sparse_paged_attention(
+             raise ValueError("QSA output gate must match the query dtype and device")
+@@ -2453,10 +2766,10 @@ def qsa_sparse_paged_attention(
                  _qsa_output_gate(xqa_output, output_gate_view)
              return xqa_output
  
@@ -2401,7 +2439,7 @@ index aa5e6a6..7d06033 100644
          physical_indices = torch.empty_like(logical_indices)
          _qsa_resolve_physical_indices_kernel[(1, triton.cdiv(2051, 256))](
              logical_indices,
-@@ -2500,16 +2805,18 @@ def qsa_sparse_paged_attention(
+@@ -2500,16 +2813,18 @@ def qsa_sparse_paged_attention(
          partial_lse = out
      else:
          # FP32 partials preserve accuracy when merging independently normalized
@@ -2430,7 +2468,7 @@ index aa5e6a6..7d06033 100644
      partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
      _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
          q,
-@@ -2554,6 +2861,10 @@ def qsa_sparse_paged_attention(
+@@ -2554,6 +2869,10 @@ def qsa_sparse_paged_attention(
          BLOCK_N=block_n,
          KV_E4M3=kv_e4m3,
          RESOLVED_INDICES=resolved_indices,
@@ -2441,7 +2479,7 @@ index aa5e6a6..7d06033 100644
          num_warps=partial_warps,
          num_stages=2,
      )
-@@ -2577,6 +2888,8 @@ def qsa_sparse_paged_attention(
+@@ -2577,6 +2896,8 @@ def qsa_sparse_paged_attention(
          NUM_SPLITS=num_splits,
          BLOCK_SPLITS=triton.next_power_of_2(num_splits),
          KV_E4M3=kv_e4m3,
@@ -2450,7 +2488,7 @@ index aa5e6a6..7d06033 100644
          num_warps=2,
          num_stages=1,
      )
-@@ -2624,7 +2937,7 @@ def _use_sm70_qsa_two_warp_partial(
+@@ -2624,7 +2945,7 @@ def _use_sm70_qsa_two_warp_partial(
      """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
      return bool(
          0 < num_query_tokens <= 16
@@ -2460,8 +2498,6 @@ index aa5e6a6..7d06033 100644
          and current_platform.is_device_capability(70)
      )
 ```
-
----
 
 ### 5.16 `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py` — DCP2 _qsa_localize_dcp_indices_kernel 半宽存储、物理 KV 槽位融合解析（D2, D10）与 valid_counts 统计（P11 / D17）
 
@@ -2624,8 +2660,6 @@ index 050f072..e76f74c 100644
      return out
 ```
 
----
-
 ### 5.17 `vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py` — QSA Pre-Indexer 当 num_q_work == 0 时跳过 q_norm + q_rope（D18）
 
 ```diff
@@ -2657,8 +2691,6 @@ index 3c16955..2aeb8d0 100644
          q,
          q.stride(0),
 ```
-
----
 
 ### 5.18 `vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py` — QSA Shared Key Norm 持久输出缓冲复用（D7）
 
@@ -2711,13 +2743,11 @@ index 8b5f9b8..51e7a11 100644
          visible,
 ```
 
----
-
-### 5.19 `vllm/models/qwen4_exp/nvidia/ple_layer.py` — PLE 2D 网格短卷积（D15）、行主序 4-tap Triton Prefill 短卷积 + 状态更新、全尺寸 m > 32 N-gram 哈希与多请求投机短卷积（P13 / D20）
+### 5.19 `vllm/models/qwen4_exp/nvidia/ple_layer.py` — PLE 2D 网格短卷积（D15）、行主序 4-tap Triton Prefill 短卷积 + 状态更新（修复 Triton 0D 标量）、全尺寸 m > 32 N-gram 哈希与多请求投机短卷积（P13 / D20 / D29）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
-index f1afbd5..092ad09 100644
+index f1afbd5..662e584 100644
 --- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
 +++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
 @@ -317,61 +317,99 @@ def _qwen38_ple_m1_short_conv_kernel(
@@ -2878,7 +2908,7 @@ index f1afbd5..092ad09 100644
  
      update_mask = hidden_mask & valid
      tl.store(state_ptr + state_base, s1, mask=update_mask)
-@@ -398,6 +440,524 @@ def _qwen38_ple_m1_short_conv_kernel(
+@@ -398,6 +440,525 @@ def _qwen38_ple_m1_short_conv_kernel(
      tl.store(state_ptr + state_base + 8 * STATE_STRIDE_2, x, mask=update_mask)
  
  
@@ -2907,8 +2937,8 @@ index f1afbd5..092ad09 100644
 +    hidden_mask = hidden < HIDDEN_SIZE
 +
 +    if NUM_REQS == 1:
-+        req = tl.zeros([], dtype=tl.int64)
-+        req_start = tl.zeros([], dtype=tl.int64)
++        req = row * 0
++        req_start = tl.load(q_starts_ptr).to(tl.int64)
 +    else:
 +        req_offsets = tl.arange(0, BLOCK_R)
 +        starts = tl.load(
@@ -3303,8 +3333,9 @@ index f1afbd5..092ad09 100644
 +        mask=hidden_mask & (4 < end - start) & (start + 4 < ROWS),
 +    )
 +
++    rows_i64 = ROWS + start * 0
 +    r_pad = start + 5
-+    r_pad_end = tl.minimum(end, ROWS)
++    r_pad_end = tl.minimum(end, rows_i64)
 +    while r_pad < r_pad_end:
 +        tl.store(
 +            output_ptr + r_pad * HIDDEN_SIZE + hidden,
@@ -3313,8 +3344,8 @@ index f1afbd5..092ad09 100644
 +        )
 +        r_pad += 1
 +    if req == 0:
-+        r_pre = tl.zeros([], dtype=tl.int64)
-+        r_pre_end = tl.minimum(start, ROWS)
++        r_pre = start * 0
++        r_pre_end = tl.minimum(start, rows_i64)
 +        while r_pre < r_pre_end:
 +            tl.store(
 +                output_ptr + r_pre * HIDDEN_SIZE + hidden,
@@ -3324,7 +3355,7 @@ index f1afbd5..092ad09 100644
 +            r_pre += 1
 +    if req == NUM_REQS - 1:
 +        r = end
-+        while r < ROWS:
++        while r < rows_i64:
 +            tl.store(
 +                output_ptr + r * HIDDEN_SIZE + hidden,
 +                0.0,
@@ -3403,7 +3434,7 @@ index f1afbd5..092ad09 100644
  def _splitmix64(value: int) -> int:
      value = (value + _SPLITMIX_GAMMA) & _MASK64
      value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
-@@ -1529,8 +2089,35 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+@@ -1529,8 +2090,35 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                  self.ngram_heads_vocab_sizes,
                  self.ngram_heads_offsets,
              )
@@ -3441,7 +3472,7 @@ index f1afbd5..092ad09 100644
                  return sm70_ple_ngram_ids(
                      input_ids,
                      query_start_loc,
-@@ -2215,27 +2802,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2215,27 +2803,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
          state_indices_tensor_d: torch.Tensor,
          has_initial_states_d: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -3479,7 +3510,7 @@ index f1afbd5..092ad09 100644
              and state_indices_tensor_d.dtype in (torch.int32, torch.int64)
              and state_indices_tensor_d.is_cuda
              and state_indices_tensor_d.is_contiguous()
-@@ -2255,7 +2847,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2255,7 +2848,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                  if has_initial_states_d is None
                  else has_initial_states_d
              )
@@ -3488,7 +3519,7 @@ index f1afbd5..092ad09 100644
                  x_d,
                  conv_state,
                  conv_weights,
-@@ -2386,11 +2978,91 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2386,11 +2979,91 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
  
          hidden_size = x_p.shape[1]
          state_len = self.conv_state_len
@@ -3584,7 +3615,7 @@ index f1afbd5..092ad09 100644
  
          state_indices = state_indices_tensor_p[:num_prefills].to(
              device=conv_state.device, dtype=torch.int64
-@@ -2409,8 +3081,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2409,8 +3082,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
          # the profiling run never takes. Keep at most two alive: pack the
          # tokens straight into the channels-first history, take the next state
          # before the convolution, and free each buffer as soon as it is spent.
@@ -3601,7 +3632,7 @@ index f1afbd5..092ad09 100644
          next_state = None
          if state_len > 0 and conv_state.shape[0] > 0:
              state = conv_state.index_select(0, state_indices)[..., :state_len].to(
-@@ -2446,7 +3124,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2446,7 +3125,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
          conv_output.masked_fill_(
              ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1), 0
          )
@@ -3613,7 +3644,7 @@ index f1afbd5..092ad09 100644
          del conv_output
  
          if next_state is not None:
-@@ -2492,18 +3173,23 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2492,18 +3174,23 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
          hidden_size = x_spec.size(-1)
          if (
              layer_policy().value("ple_spec_conv")
@@ -3640,7 +3671,7 @@ index f1afbd5..092ad09 100644
              and conv_state.dtype in (torch.float16, torch.float32)
              and all(
                  t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
-@@ -2516,16 +3202,45 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2516,16 +3203,45 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
              and current_platform.is_device_capability((7, 0))
          ):
              output = torch.empty_like(x_spec)
@@ -3690,7 +3721,7 @@ index f1afbd5..092ad09 100644
              return output
          # Use a fixed packing width instead of synchronizing on lengths.max().
          max_len = spec_query_len
-@@ -2799,7 +3514,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2799,7 +3515,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
              inputs,
              layer_attn_metadata,
              conv_state,
@@ -3703,7 +3734,7 @@ index f1afbd5..092ad09 100644
          )
  
      def forward(
-@@ -2850,7 +3569,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+@@ -2850,7 +3570,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
          normalized = snapshot_ple_diagnostic(
              normalized, self.prefix + ":07_conv_input", diagnostic
          )
@@ -3712,7 +3743,7 @@ index f1afbd5..092ad09 100644
          torch.ops.vllm.qwen4_exp_ple_short_conv(
              normalized,
              conv_output,
-@@ -2869,7 +3588,11 @@ def qwen4_exp_ple_short_conv(
+@@ -2869,7 +3589,11 @@ def qwen4_exp_ple_short_conv(
  ) -> None:
      layer = get_forward_context().no_compile_layers[layer_name]
      result = layer._short_conv(inputs)
@@ -3727,16 +3758,48 @@ index f1afbd5..092ad09 100644
  def qwen4_exp_ple_short_conv_fake(
 ```
 
----
-
-### 5.20 `vllm/models/qwen4_exp/nvidia/qsa.py` — QSA 3D 门控视图直传（P2）、DCP A2A 融合门控（D1）、跳过冗余清零（D4）、异步 AllGather 重叠 Indexer（D14）、解除 qsa_prep_sm70_out 32 行上限（P12 / D19）与 DCP2 valid_counts 透传（P11 / D17）
+### 5.20 `vllm/models/qwen4_exp/nvidia/qsa.py` — QSA 3D 门控视图直传（P2）、DCP A2A 融合门控（D1）、跳过冗余清零（D4）、草稿块表 broadcast 修复（D5 / D28）、异步 AllGather 重叠 Indexer（D14）、DCP2 valid_counts 透传（P11 / D17）与图捕获安全工作区（D29）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
-index 7826024..43dea07 100644
+index 7826024..d4deb0e 100644
 --- a/vllm/models/qwen4_exp/nvidia/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/qsa.py
-@@ -153,10 +153,24 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
+@@ -5,7 +5,7 @@
+ from __future__ import annotations
+ 
+ import math
+-from typing import ClassVar, cast
++from typing import Any, ClassVar, cast
+ 
+ import torch
+ from torch import nn
+@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.flash_attn import (
+     FlashAttentionMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     FullAttentionSpec,
+@@ -69,6 +70,16 @@ from .indexer_qsa import QSAIndexer
+ 
+ logger = init_logger(__name__)
+ 
++_SM70_QSA_DCP_AG_WORKSPACES: dict[
++    tuple[int, int, torch.dtype], tuple[int, torch.Tensor, torch.Tensor]
++] = {}
++_SM70_QSA_DCP_VALID_COUNTS_WORKSPACES: dict[
++    tuple[int, int], tuple[int, torch.Tensor]
++] = {}
++_SM70_QSA_PREPARED_Q_WORKSPACES: dict[
++    tuple[int, int, torch.dtype], tuple[int, torch.Tensor]
++] = {}
++
+ 
+ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
+     """Flash metadata supporting uniform decode and target-verify graphs."""
+@@ -153,10 +164,24 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
              ):
                  raise RuntimeError("QSA draft block-table buffer is too small")
              expanded = self.draft_block_table_buffer[:rows, : columns * expansion]
@@ -3765,7 +3828,7 @@ index 7826024..43dea07 100644
              common_attn_metadata = common_attn_metadata.replace(
                  block_table_tensor=expanded
              )
-@@ -258,6 +272,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -258,6 +283,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          output_scale: torch.Tensor | None = None,
          output_block_scale: torch.Tensor | None = None,
          dense_short_context: bool = False,
@@ -3773,7 +3836,7 @@ index 7826024..43dea07 100644
      ) -> torch.Tensor:
          del key, value
          if output_scale is not None or output_block_scale is not None:
-@@ -268,10 +283,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -268,10 +294,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              raise NotImplementedError("QSA does not support sliding-window attention")
  
          num_tokens = attn_metadata.num_actual_tokens
@@ -3792,7 +3855,7 @@ index 7826024..43dea07 100644
          else:
              output.zero_()
          if num_tokens == 0:
-@@ -300,9 +319,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -300,9 +330,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              return output
          # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
          # [num_blocks, 2, block_size, num_kv_heads, head_size].
@@ -3811,7 +3874,7 @@ index 7826024..43dea07 100644
          if query.dtype not in (torch.float16, torch.bfloat16):
              raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
          if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-@@ -348,6 +373,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -348,6 +384,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                  token_to_req,
                  output[:num_tokens],
                  output_gate[:num_tokens],
@@ -3819,7 +3882,7 @@ index 7826024..43dea07 100644
              )
              return output
  
-@@ -373,6 +399,92 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -373,6 +410,87 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          )
          return output
  
@@ -3841,43 +3904,38 @@ index 7826024..43dea07 100644
 +        rows, heads, dim = q_contig.shape
 +        world_size = self.dcp_world_size
 +        needed = world_size * rows * heads * dim
-+        recv_buf = getattr(self, "_dcp_ag_recv_buffer", None)
-+        if (
-+            recv_buf is None
-+            or recv_buf.numel() < needed
-+            or recv_buf.dtype != q_contig.dtype
-+            or recv_buf.device != q_contig.device
-+        ):
-+            cap = 1 << (max(needed, 1) - 1).bit_length()
-+            if (
-+                recv_buf is not None
-+                and recv_buf.device == q_contig.device
-+                and recv_buf.dtype == q_contig.dtype
-+            ):
-+                cap = max(cap, recv_buf.numel())
-+            recv_buf = torch.empty((cap,), dtype=q_contig.dtype, device=q_contig.device)
-+            self._dcp_ag_recv_buffer = recv_buf
-+        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
-+        out_buf: torch.Tensor | None = None
-+        if rows > 1:
-+            out_buf = getattr(self, "_dcp_ag_out_buffer", None)
-+            if (
-+                out_buf is None
-+                or out_buf.numel() < needed
-+                or out_buf.dtype != q_contig.dtype
-+                or out_buf.device != q_contig.device
-+            ):
++        if q_contig.is_cuda:
++            device_index = (
++                q_contig.device.index if q_contig.device.index is not None else -1
++            )
++            stream_id = int(torch.cuda.current_stream(q_contig.device).cuda_stream)
++            ws_key = (device_index, stream_id, q_contig.dtype)
++            ws_cache = workspace_cache("qsa_dcp_ag", _SM70_QSA_DCP_AG_WORKSPACES)
++            workspace = ws_cache.get(ws_key)
++            if workspace is None or workspace[0] < needed:
 +                cap = 1 << (max(needed, 1) - 1).bit_length()
-+                if (
-+                    out_buf is not None
-+                    and out_buf.device == q_contig.device
-+                    and out_buf.dtype == q_contig.dtype
-+                ):
-+                    cap = max(cap, out_buf.numel())
++                if workspace is not None:
++                    cap = max(cap, workspace[0])
++                recv_buf = torch.empty(
++                    (cap,), dtype=q_contig.dtype, device=q_contig.device
++                )
 +                out_buf = torch.empty(
 +                    (cap,), dtype=q_contig.dtype, device=q_contig.device
 +                )
-+                self._dcp_ag_out_buffer = out_buf
++                workspace = (cap, recv_buf, out_buf)
++                ws_cache[ws_key] = workspace
++            retain_for_capture(ws_cache, workspace, q_contig)
++            _, recv_buf, out_buf = workspace
++        else:
++            recv_buf = torch.empty(
++                (needed,), dtype=q_contig.dtype, device=q_contig.device
++            )
++            out_buf = (
++                torch.empty((needed,), dtype=q_contig.dtype, device=q_contig.device)
++                if rows > 1
++                else None
++            )
++        recv_view = recv_buf[:needed].view(world_size * rows, heads, dim)
 +        work = torch.distributed.all_gather_into_tensor(
 +            recv_view, q_contig, group=device_group, async_op=True
 +        )
@@ -3912,7 +3970,7 @@ index 7826024..43dea07 100644
      def _forward_qsa_dcp(
          self,
          layer: torch.nn.Module,
-@@ -384,8 +496,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -384,8 +502,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          token_to_req: torch.Tensor,
          output: torch.Tensor,
          output_gate: torch.Tensor,
@@ -3926,7 +3984,7 @@ index 7826024..43dea07 100644
  
          from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
          from .ops.qsa_dcp import (
-@@ -405,33 +522,73 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -405,33 +528,89 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              )
          ):
              raise RuntimeError("QSA DCP target workspaces are not initialized")
@@ -3943,20 +4001,35 @@ index 7826024..43dea07 100644
 +        )
 +        resolve_physical = bool(key_cache.shape[0] * key_cache.shape[1] < 2**31)
 +        rows = query.shape[0]
-+        counts_buf = getattr(self, "_dcp_valid_counts_buffer", None)
-+        if (
-+            counts_buf is None
-+            or counts_buf.numel() < rows
-+            or counts_buf.device != logical_indices.device
-+        ):
-+            cap = 1 << (max(rows, 1) - 1).bit_length()
-+            if counts_buf is not None and counts_buf.device == logical_indices.device:
-+                cap = max(cap, counts_buf.numel())
-+            counts_buf = torch.empty(
-+                (cap,), dtype=torch.int32, device=logical_indices.device
++        if logical_indices.is_cuda:
++            device_index = (
++                logical_indices.device.index
++                if logical_indices.device.index is not None
++                else -1
 +            )
-+            self._dcp_valid_counts_buffer = counts_buf
-+        local_valid_counts = counts_buf[:rows]
++            stream_id = int(
++                torch.cuda.current_stream(logical_indices.device).cuda_stream
++            )
++            counts_key = (device_index, stream_id)
++            counts_cache = workspace_cache(
++                "qsa_dcp_valid_counts", _SM70_QSA_DCP_VALID_COUNTS_WORKSPACES
++            )
++            counts_ws = counts_cache.get(counts_key)
++            if counts_ws is None or counts_ws[0] < rows:
++                cap = 1 << (max(rows, 1) - 1).bit_length()
++                if counts_ws is not None:
++                    cap = max(cap, counts_ws[0])
++                counts_buf = torch.empty(
++                    (cap,), dtype=torch.int32, device=logical_indices.device
++                )
++                counts_ws = (cap, counts_buf)
++                counts_cache[counts_key] = counts_ws
++            retain_for_capture(counts_cache, counts_ws, logical_indices)
++            local_valid_counts = counts_ws[1][:rows]
++        else:
++            local_valid_counts = torch.empty(
++                (rows,), dtype=torch.int32, device=logical_indices.device
++            )
          local_indices = qsa_localize_dcp_indices(
              logical_indices,
 -            local_indices_buffer[: query.shape[0]],
@@ -3974,27 +4047,9 @@ index 7826024..43dea07 100644
 -        gathered_query = group.all_gather(query.contiguous(), dim=1)
 -        partial_output = partial_output_buffer[: query.shape[0]]
 -        partial_lse = partial_lse_buffer[: query.shape[0]]
++        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
 +        partial_output = partial_output_buffer[:rows]
 +        partial_lse = partial_lse_buffer[:rows]
-+        use_fused_a2a_pack = bool(
-+            self.dcp_combine is dcp_a2a_lse_reduce
-+            and self.dcp_world_size > 1
-+            and partial_output.dtype == torch.float32
-+        )
-+        send_buffer: torch.Tensor | None = None
-+        recv_buffer: torch.Tensor | None = None
-+        if use_fused_a2a_pack:
-+            send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
-+                (
-+                    self.dcp_world_size,
-+                    rows,
-+                    query.shape[1],
-+                    query.shape[2] + 1,
-+                ),
-+                device=partial_output.device,
-+                dtype=partial_output.dtype,
-+            )
-+        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
          if partial_output.shape != gathered_query.shape:
              raise RuntimeError("QSA DCP partial output has wrong head geometry")
 -        # Only this prefix of the compacted columns can hold an owned token.
@@ -4004,7 +4059,25 @@ index 7826024..43dea07 100644
 -            self.dcp_world_size,
 -            layer.cp_kv_cache_interleave_size,
 -            local_indices.shape[1],
--        )
++        use_fused_a2a_pack = bool(
++            self.dcp_combine is dcp_a2a_lse_reduce
++            and self.dcp_world_size > 1
++            and partial_output.dtype == torch.float32
++            and gathered_query.shape[1] % self.dcp_world_size == 0
+         )
++        send_buffer: torch.Tensor | None = None
++        recv_buffer: torch.Tensor | None = None
++        if use_fused_a2a_pack:
++            send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
++                (
++                    self.dcp_world_size,
++                    rows,
++                    gathered_query.shape[1] // self.dcp_world_size,
++                    gathered_query.shape[2] + 1,
++                ),
++                device=partial_output.device,
++                dtype=partial_output.dtype,
++            )
          qsa_sparse_paged_attention(
              gathered_query,
              key_cache,
@@ -4014,15 +4087,19 @@ index 7826024..43dea07 100644
              block_table,
              token_to_req,
              partial_output,
-@@ -439,7 +596,23 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -439,7 +618,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              k_scale=layer._k_scale_float,
              v_scale=layer._v_scale_float,
              lse=partial_lse,
 +            pre_resolved_indices=resolve_physical,
 +            dcp_packed_out=send_buffer,
 +            valid_counts=local_valid_counts,
++        )
++        gate_view = (
++            output_gate
++            if output_gate.shape == output.shape
++            else output_gate.reshape(output.shape)
          )
-+        gate_view = output_gate.view_as(output)
 +        if self.dcp_combine is dcp_a2a_lse_reduce:
 +            dcp_a2a_lse_reduce(
 +                partial_output,
@@ -4038,7 +4115,7 @@ index 7826024..43dea07 100644
          merged = cast(
              torch.Tensor,
              self.dcp_combine(
-@@ -453,7 +626,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -453,7 +652,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          # apply the Triton gate DCP1's page4 route uses. This replaces a chain
          # of five elementwise kernels (12.2 us per decode layer on V100).
          output.copy_(merged)
@@ -4047,7 +4124,7 @@ index 7826024..43dea07 100644
  
  
  def _verify_e4m3_kv_requirements(
-@@ -862,6 +1035,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -862,6 +1061,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          self,
          qkv: torch.Tensor,
          positions: torch.Tensor,
@@ -4056,7 +4133,7 @@ index 7826024..43dea07 100644
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
          """Split, normalize, and rotate Q/K using this tree's Qwen3 API."""
          q_gate, key, value = qkv.split(
-@@ -875,7 +1050,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -875,7 +1076,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              key.view(*token_shape, self.num_kv_heads, self.head_dim)
          ).reshape(*token_shape, self.kv_size)
          query, key = self.rotary_emb(positions, query, key)
@@ -4067,7 +4144,7 @@ index 7826024..43dea07 100644
  
      def _use_dense_short_context(
          self, num_tokens: int, side_metadata: QSAForwardMetadata
-@@ -956,34 +1133,53 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -956,34 +1159,61 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  value[:num_tokens],
              )
          dense = self._use_dense_short_context(num_tokens, side_metadata)
@@ -4108,25 +4185,33 @@ index 7826024..43dea07 100644
 +                self._cached_raw_kv_unbind_key = kv_cache_key
 +                self._cached_raw_kv_unbind_pair = (key_cache, value_cache)
 +            needed_q = num_tokens * self.num_heads * self.head_dim
-+            prep_buf = getattr(self, "_prepared_q_buffer", None)
-+            if (
-+                prep_buf is None
-+                or prep_buf.numel() < needed_q
-+                or prep_buf.dtype != query.dtype
-+                or prep_buf.device != query.device
-+            ):
-+                cap = 1 << (max(needed_q, 1) - 1).bit_length()
-+                if (
-+                    prep_buf is not None
-+                    and prep_buf.device == query.device
-+                    and prep_buf.dtype == query.dtype
-+                ):
-+                    cap = max(cap, prep_buf.numel())
-+                prep_buf = torch.empty((cap,), dtype=query.dtype, device=query.device)
-+                self._prepared_q_buffer = prep_buf
-+            prepared = prep_buf[:needed_q].view(
-+                num_tokens, self.num_heads, self.head_dim
-+            )
++            if query.is_cuda:
++                device_index = (
++                    query.device.index if query.device.index is not None else -1
++                )
++                stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
++                prep_key = (device_index, stream_id, query.dtype)
++                prep_cache = workspace_cache(
++                    "qsa_prepared_q", _SM70_QSA_PREPARED_Q_WORKSPACES
++                )
++                prep_ws = prep_cache.get(prep_key)
++                if prep_ws is None or prep_ws[0] < needed_q:
++                    cap = 1 << (max(needed_q, 1) - 1).bit_length()
++                    if prep_ws is not None:
++                        cap = max(cap, prep_ws[0])
++                    prep_buf = torch.empty(
++                        (cap,), dtype=query.dtype, device=query.device
++                    )
++                    prep_ws = (cap, prep_buf)
++                    prep_cache[prep_key] = prep_ws
++                retain_for_capture(prep_cache, prep_ws, query)
++                prepared = prep_ws[1][:needed_q].view(
++                    num_tokens, self.num_heads, self.head_dim
++                )
++            else:
++                prepared = query.new_empty(
++                    (num_tokens, self.num_heads, self.head_dim)
++                )
 +            text_positions = (positions[0] if positions.dim() == 2 else positions)[
 +                :num_tokens
 +            ]
@@ -4142,7 +4227,7 @@ index 7826024..43dea07 100644
                  self.rotary_emb.cos_sin_cache,
                  self.q_norm.weight,
                  self.k_norm.weight,
-@@ -991,7 +1187,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -991,7 +1221,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  prepared,
                  key_cache,
                  value_cache,
@@ -4151,7 +4236,7 @@ index 7826024..43dea07 100644
              )
              query = key = value = prepared
          else:
-@@ -1002,6 +1198,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1002,6 +1232,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  self.kv_cache,
                  main_metadata.slot_mapping,
              )
@@ -4178,7 +4263,7 @@ index 7826024..43dea07 100644
          impl.forward_qsa(
              self,
              query,
-@@ -1015,6 +1231,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1015,6 +1265,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              query_positions=side_metadata.logical_positions,
              sequence_lengths=side_metadata.seq_lens,
              dense_short_context=dense,
@@ -4186,14 +4271,7 @@ index 7826024..43dea07 100644
          )
          _sm70_dump_qwen_layer_tensor(
              "qsa_core_out",
-@@ -1037,18 +1254,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
-             qkv, indexer_input = side(hidden_states)
-         else:
-             qkv, _ = self.qkv_proj(hidden_states)
--        if self._sm70_qsa_prep and num_tokens <= 32:
-+        if self._sm70_qsa_prep and num_tokens >= 1:
-             # Raw rows go to the attention op, which normalizes, rotates and
-             # caches them in one launch; the gate stays strided in q_gate.
+@@ -1043,12 +1294,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              q_gate = qkv[:, : self.q_size * 2].view(
                  num_tokens, self.num_heads, 2 * self.head_dim
              )
@@ -4211,8 +4289,6 @@ index 7826024..43dea07 100644
              key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
              value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
 ```
-
----
 
 ### 5.21 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` — GDN 投影拆分网格缩减（P5）、Key-only index_qk_proj 128×2560 计划（D22）与 shared_expert.down_proj 专用 GEMV 计划（D23）
 
@@ -4269,8 +4345,6 @@ index 14b4750..b25d2fe 100644
          if prefix.endswith(suffix) and shape == expected_shape:
              return plan
 ```
-
----
 
 ### 5.22 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py` — MTP Prefill 单次 AllGather 合并 fc（P8）与 Decode 单内核融合 _qwen38_mtp_fc_fused_gemv_add_kernel（D24）
 
@@ -4441,9 +4515,7 @@ index 658f74f..f621be8 100644
 +    return tensor_model_parallel_all_gather(local_sum).flatten(-2)
 ```
 
----
-
-### 5.23 `vllm/v1/attention/backends/gdn_attn.py` — GDN Decode 向量化草稿块表展开与延迟计算 num_computed_tokens（D5, D6）
+### 5.23 `vllm/v1/attention/backends/gdn_attn.py` — GDN Decode 延迟仅在 num_prefills > 0 时计算 num_computed_tokens（D6）
 
 ```diff
 diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
@@ -4468,53 +4540,63 @@ index 3fb9816..34f5ce9 100644
                  has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
 ```
 
----
-
-### 5.24 `vllm/v1/attention/ops/dcp_alltoall.py` — DCP2 All-to-All LSE 解包合并 + FP16 舍入 + Sigmoid 输出门控融合及打包直传（D1, D13）
+### 5.24 `vllm/v1/attention/ops/dcp_alltoall.py` — DCP2 All-to-All LSE 解包合并 + FP16 舍入 + Sigmoid 输出门控融合及图捕获安全打包工作区（D1, D13, D29）
 
 ```diff
 diff --git a/vllm/v1/attention/ops/dcp_alltoall.py b/vllm/v1/attention/ops/dcp_alltoall.py
-index 1469a5c..3e37f55 100644
+index 1469a5c..60159f9 100644
 --- a/vllm/v1/attention/ops/dcp_alltoall.py
 +++ b/vllm/v1/attention/ops/dcp_alltoall.py
-@@ -103,6 +103,11 @@ def _lse_weighted_combine(
+@@ -26,6 +26,7 @@ import torch
+ import torch.distributed as dist
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+     is_workspace_manager_initialized,
+@@ -103,6 +104,11 @@ def _lse_weighted_combine(
      return result
  
  
 +_DCP_A2A_BUFFERS: dict[
-+    tuple[torch.device, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
++    tuple[int, int, torch.dtype], tuple[int, torch.Tensor, torch.Tensor]
 +] = {}
 +
 +
  def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
      bits = torch.finfo(output_dtype).bits
      if bits == 16:
-@@ -124,6 +129,24 @@ def _dcp_a2a_send_recv_buffers(
+@@ -124,6 +130,28 @@ def _dcp_a2a_send_recv_buffers(
          )
          return send_buffer, recv_buffer
  
 +    needed = 1
 +    for dim in shape:
 +        needed *= dim
-+    if device.type == "cuda" and not torch.cuda.is_current_stream_capturing():
-+        stream_id = torch.cuda.current_stream(device).cuda_stream
-+        key = (device, stream_id, dtype)
-+        cached = _DCP_A2A_BUFFERS.get(key)
-+        if cached is None or cached[0].numel() < needed:
++    if device.type == "cuda":
++        device_index = device.index if device.index is not None else -1
++        stream_id = int(torch.cuda.current_stream(device).cuda_stream)
++        key = (device_index, stream_id, dtype)
++        cache = workspace_cache("dcp_a2a_send_recv", _DCP_A2A_BUFFERS)
++        cached = cache.get(key)
++        if cached is None or cached[0] < needed:
 +            cap = 1 << (max(needed, 1) - 1).bit_length()
 +            if cached is not None:
-+                cap = max(cap, cached[0].numel())
++                cap = max(cap, cached[0])
 +            cached = (
++                cap,
 +                torch.empty((cap,), device=device, dtype=dtype),
 +                torch.empty((cap,), device=device, dtype=dtype),
 +            )
-+            _DCP_A2A_BUFFERS[key] = cached
-+        return cached[0][:needed].view(shape), cached[1][:needed].view(shape)
++            cache[key] = cached
++        retain_for_capture(cache, cached, cached[1])
++        return cached[1][:needed].view(shape), cached[2][:needed].view(shape)
 +
      return (
          torch.empty(shape, device=device, dtype=dtype),
          torch.empty(shape, device=device, dtype=dtype),
-@@ -198,6 +221,7 @@ def _dcp_a2a_unpack_combine_kernel(
+@@ -198,6 +226,7 @@ def _dcp_a2a_unpack_combine_kernel(
      recv_ptr,
      out_ptr,
      out_lse_ptr,
@@ -4522,7 +4604,7 @@ index 1469a5c..3e37f55 100644
      recv_stride_N,
      recv_stride_B,
      recv_stride_H,
-@@ -207,11 +231,15 @@ def _dcp_a2a_unpack_combine_kernel(
+@@ -207,11 +236,15 @@ def _dcp_a2a_unpack_combine_kernel(
      out_stride_D,
      out_lse_stride_B,
      out_lse_stride_H,
@@ -4538,7 +4620,7 @@ index 1469a5c..3e37f55 100644
  ):
      batch_idx = tl.program_id(0).to(tl.int64)
      head_idx = tl.program_id(1).to(tl.int64)
-@@ -310,6 +338,18 @@ def _dcp_a2a_unpack_combine_kernel(
+@@ -310,6 +343,18 @@ def _dcp_a2a_unpack_combine_kernel(
      final_offsets = (
          batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
      )
@@ -4557,7 +4639,7 @@ index 1469a5c..3e37f55 100644
      tl.store(out_ptr + final_offsets, acc)
  
      if RETURN_LSE:
-@@ -353,23 +393,32 @@ def _dcp_a2a_unpack_combine(
+@@ -353,23 +398,32 @@ def _dcp_a2a_unpack_combine(
      lse_pack_dim: int,
      return_lse: bool,
      is_lse_base_on_e: bool,
@@ -4599,7 +4681,7 @@ index 1469a5c..3e37f55 100644
          recv_buffer.stride(0),
          recv_buffer.stride(1),
          recv_buffer.stride(2),
-@@ -377,15 +426,20 @@ def _dcp_a2a_unpack_combine(
+@@ -377,15 +431,20 @@ def _dcp_a2a_unpack_combine(
          out.stride(0),
          out.stride(1),
          out.stride(2),
@@ -4622,7 +4704,7 @@ index 1469a5c..3e37f55 100644
          return out, out_lse
      return out
  
-@@ -397,6 +451,10 @@ def dcp_a2a_lse_reduce(
+@@ -397,6 +456,10 @@ def dcp_a2a_lse_reduce(
      ctx: CPTritonContext | None = None,
      return_lse: bool = False,
      is_lse_base_on_e: bool = True,
@@ -4633,7 +4715,7 @@ index 1469a5c..3e37f55 100644
  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
      """
      Combine partial attention outputs across DCP ranks using All-to-All.
-@@ -411,6 +469,13 @@ def dcp_a2a_lse_reduce(
+@@ -411,6 +474,13 @@ def dcp_a2a_lse_reduce(
          ctx: CPTritonContext (unused, for signature compatibility)
          return_lse: If True, also return the combined global LSE
          is_lse_base_on_e: If True, LSE is base e; if False, base 2
@@ -4647,7 +4729,7 @@ index 1469a5c..3e37f55 100644
  
      Returns:
          Combined output [B, H/N, D] (head-scattered)
-@@ -419,9 +484,17 @@ def dcp_a2a_lse_reduce(
+@@ -419,9 +489,17 @@ def dcp_a2a_lse_reduce(
      world_size = cp_group.world_size
  
      if world_size == 1:
@@ -4667,7 +4749,7 @@ index 1469a5c..3e37f55 100644
  
      B, H, D = cp_attn_out.shape
      if H % world_size != 0:
-@@ -429,21 +502,23 @@ def dcp_a2a_lse_reduce(
+@@ -429,21 +507,23 @@ def dcp_a2a_lse_reduce(
      H_per_rank = H // world_size
      lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
  
@@ -4706,7 +4788,7 @@ index 1469a5c..3e37f55 100644
  
      work = dist.all_to_all_single(
          recv_buffer.view(-1),
-@@ -454,5 +529,11 @@ def dcp_a2a_lse_reduce(
+@@ -454,5 +534,11 @@ def dcp_a2a_lse_reduce(
      work.wait()
  
      return _dcp_a2a_unpack_combine(
@@ -4721,13 +4803,11 @@ index 1469a5c..3e37f55 100644
      )
 ```
 
----
-
-### 5.25 `vllm/v1/spec_decode/llm_base_proposer.py` — Chunked Prefill 中间块提前退出（P7）、接入 index_share_for_mtp_iteration（D18）与 DP2×TP4 dummy_run AllReduce 对齐（D26）
+### 5.25 `vllm/v1/spec_decode/llm_base_proposer.py` — Chunked Prefill 中间块提前退出与 DP2 通信对齐（P7, D29）、接入 index_share_for_mtp_iteration（D18）及 DP2×TP4 dummy_run AllReduce 对齐（D26）
 
 ```diff
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
-index f547596..60391c7 100644
+index f547596..3566428 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/vllm/v1/spec_decode/llm_base_proposer.py
 @@ -1167,6 +1167,8 @@ class SpecDecodeBaseProposer:
@@ -4739,7 +4819,7 @@ index f547596..60391c7 100644
          with set_forward_context(
              per_layer_attn_metadata,
              self.vllm_config,
-@@ -1185,6 +1187,28 @@ class SpecDecodeBaseProposer:
+@@ -1185,6 +1187,34 @@ class SpecDecodeBaseProposer:
              else:
                  last_hidden_states, hidden_states = ret_hidden_states
          self._step_profiler.finish(profile_events, "first_forward", first_forward_start)
@@ -4751,6 +4831,12 @@ index f547596..60391c7 100644
 +            and getattr(getattr(self.runner, "input_batch", None), "num_reqs", 0) > 0
 +            and is_all_chunked_prefill_fn()
 +        ):
++            if (
++                self.vllm_config.parallel_config.data_parallel_size > 1
++                and self.num_speculative_tokens > 1
++                and not self.parallel_drafting
++            ):
++                self._determine_batch_execution_and_padding(batch_size)
 +            self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
 +            self._step_profiler.add_cpu_ms(
 +                profile_cpu_ms, "total_wall_cpu", profile_wall_start
@@ -4768,7 +4854,7 @@ index f547596..60391c7 100644
          if ddtree_worker_profile:
              forward_enqueue_ms = (time.perf_counter() - forward_enqueue_t0) * 1000.0
              sync_t0 = time.perf_counter()
-@@ -1397,102 +1421,119 @@ class SpecDecodeBaseProposer:
+@@ -1397,102 +1427,119 @@ class SpecDecodeBaseProposer:
  
          block_size = self.block_size
          assert block_size > 0, "block_size has not been initialized."
@@ -4977,7 +5063,7 @@ index f547596..60391c7 100644
  
          # [batch_size, num_speculative_tokens]
          draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-@@ -2158,6 +2199,17 @@ class SpecDecodeBaseProposer:
+@@ -2158,6 +2205,17 @@ class SpecDecodeBaseProposer:
          self._maybe_share_embeddings(target_language_model)
          self._maybe_share_lm_head(target_language_model)
          self._maybe_initialize_static_draft_vocab()
@@ -4995,7 +5081,7 @@ index f547596..60391c7 100644
  
          if (
              self.parallel_drafting
-@@ -2391,16 +2443,17 @@ class SpecDecodeBaseProposer:
+@@ -2391,16 +2449,17 @@ class SpecDecodeBaseProposer:
              )
  
          for fwd_idx in fwd_indices:
@@ -5023,8 +5109,6 @@ index f547596..60391c7 100644
  
              # Make sure to use EAGLE's own buffer during cudagraph capture.
 ```
-
----
 
 ### 5.26 `vllm/v1/worker/dp_utils.py` — DP2 × TP4 独立副本保留各自 cudagraph_mode 与 num_tokens_padded（D26）
 
@@ -5075,8 +5159,6 @@ index e7c6d81..0ecc574 100644
      # should_dp_pad is True
 ```
 
----
-
 ### 5.27 `vllm/v1/worker/gpu/cudagraph_utils.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
 
 ```diff
@@ -5097,8 +5179,6 @@ index 1b04912..adf13da 100644
              input_batch.seq_lens,
 ```
 
----
-
 ### 5.28 `vllm/v1/worker/gpu/model_runner.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
 
 ```diff
@@ -5116,8 +5196,6 @@ index 324b32e..7f46a44 100644
              prepare_dcp_local_seq_lens(
                  self.input_buffers.dcp_local_seq_lens,
 ```
-
----
 
 ### 5.29 `vllm/v1/worker/gpu_model_runner.py` — Chunked Prefill MTP 提前退出配合（P7）、跳过非 MLA dcp_local_seq_lens（D12）与 DP2×TP4 禁用跨 DP dummy 死循环（D26）
 
@@ -5182,8 +5260,6 @@ index 001204b..9c66cac 100644
                  # make token id 0 look like a real speculative token to the
 ```
 
----
-
 ### 5.30 `tests/models/qwen4_exp/test_e4m3_mtp.py` — 单测：验证 _make_draft_vllm_config 正确应用 speculative_config.kv_cache_dtype（D27）
 
 ```diff
@@ -5233,8 +5309,6 @@ index 5d341e8..7a0daf5 100644
 +    assert draft_cfg.is_speculative_draft is True
 +
 ```
-
----
 
 ### 5.31 `tests/models/qwen4_exp/test_weight_loading.py` — 单测：验证 Qwen3NextForCausalLM 在 DP2×TP4 下保持副本内局部 MoE TP=4（D26）
 
@@ -5314,12 +5388,13 @@ index f8eb0ea..be6fcee 100644
 
 ## 6. 一键导出或应用全量补丁命令
 
-如果您需要将本分支的全部 40 项优化与修复（`P1`–`P13` + `D1`–`D27`）一次性导出为单个 `.patch` 文件并应用到任何干净的 `main` 分支，可直接运行：
+如果需要将本分支相对于 `main`（`be3722bc09`）的全部代码修改一键导出为单个 `.patch` 文件并应用到干净的 `main` 分支：
 
 ```bash
-# 在当前分支导出仅包含源码与单测的完整补丁
-git diff be3722bc095b9792bf9833068595f0b1ef70ad37 HEAD -- csrc/ vllm/ tests/ > sm70_qwen38_all_optimizations.patch
+# 1. 在当前分支导出全量代码补丁（不含 docs/ 文档）
+git diff be3722bc095b9792bf9833068595f0b1ef70ad37 -- csrc/ vllm/ tests/ > /tmp/sm70_qwen38_all_optimizations.patch
 
-# 在目标机器的 main 分支上一键应用
-git apply --check sm70_qwen38_all_optimizations.patch && git apply sm70_qwen38_all_optimizations.patch
+# 2. 在目标机器的 main 分支检查并一键应用补丁
+git apply --check /tmp/sm70_qwen38_all_optimizations.patch
+git apply /tmp/sm70_qwen38_all_optimizations.patch
 ```

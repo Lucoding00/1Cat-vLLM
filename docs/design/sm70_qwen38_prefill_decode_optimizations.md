@@ -893,7 +893,9 @@ index 05b7ce3..812e973 100644
 +            self.topk_indices_buffer = topk_indices_buffer
 +            if draft_vllm_config.parallel_config.decode_context_parallel_size == 2:
 +                tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
-+                local_q_heads = int(config.num_attention_heads) // max(tp_size, 1)
++                gathered_heads = (
++                    int(config.num_attention_heads) // max(tp_size, 1) * 2
++                )
 +                head_dim = int(
 +                    getattr(
 +                        config,
@@ -908,13 +910,13 @@ index 05b7ce3..812e973 100644
 +                )
 +                dcp_partial_output_buffer = torch.empty(
 +                    max_tokens,
-+                    local_q_heads,
++                    gathered_heads,
 +                    head_dim,
-+                    dtype=model_config.dtype,
++                    dtype=torch.float32,
 +                )
 +                dcp_partial_lse_buffer = torch.empty(
 +                    max_tokens,
-+                    local_q_heads,
++                    gathered_heads,
 +                    dtype=torch.float32,
 +                )
 +                self.dcp_local_indices_buffer = dcp_local_indices_buffer

@@ -25,7 +25,12 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 from .ops.qsa_pre_indexer import qsa_pre_indexer
+
+_SM70_QSA_INDEXER_Q_WORKSPACES: dict[
+    tuple[int, int, torch.dtype], tuple[int, torch.Tensor]
+] = {}
 
 
 def apply_qsa_rope(
@@ -175,6 +180,26 @@ class QSAIndexer(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         needed = num_tokens * self.index_n_heads * self.index_head_dim
+        if device.type == "cuda":
+            device_index = device.index if device.index is not None else -1
+            stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+            ws_key = (device_index, stream_id, dtype)
+            ws_cache = workspace_cache(
+                "qsa_indexer_q", _SM70_QSA_INDEXER_Q_WORKSPACES
+            )
+            workspace = ws_cache.get(ws_key)
+            if workspace is None or workspace[0] < needed:
+                cap = 1 << (max(needed, 1) - 1).bit_length()
+                if workspace is not None:
+                    cap = max(cap, workspace[0])
+                buf = torch.empty((cap,), dtype=dtype, device=device)
+                workspace = (cap, buf)
+                ws_cache[ws_key] = workspace
+            retain_for_capture(ws_cache, workspace, workspace[1])
+            buf = workspace[1]
+            return buf[:needed].view(
+                num_tokens, self.index_n_heads, self.index_head_dim
+            )
         buf = self._q_buffer
         if (
             buf is None

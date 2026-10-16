@@ -465,8 +465,8 @@ def _qwen38_ple_prefill_short_conv_kernel(
     hidden_mask = hidden < HIDDEN_SIZE
 
     if NUM_REQS == 1:
-        req = tl.zeros([], dtype=tl.int64)
-        req_start = tl.zeros([], dtype=tl.int64)
+        req = row * 0
+        req_start = tl.load(q_starts_ptr).to(tl.int64)
     else:
         req_offsets = tl.arange(0, BLOCK_R)
         starts = tl.load(
@@ -861,8 +861,9 @@ def _qwen38_ple_spec_short_conv_kernel(
         mask=hidden_mask & (4 < end - start) & (start + 4 < ROWS),
     )
 
+    rows_i64 = ROWS + start * 0
     r_pad = start + 5
-    r_pad_end = tl.minimum(end, ROWS)
+    r_pad_end = tl.minimum(end, rows_i64)
     while r_pad < r_pad_end:
         tl.store(
             output_ptr + r_pad * HIDDEN_SIZE + hidden,
@@ -871,8 +872,8 @@ def _qwen38_ple_spec_short_conv_kernel(
         )
         r_pad += 1
     if req == 0:
-        r_pre = tl.zeros([], dtype=tl.int64)
-        r_pre_end = tl.minimum(start, ROWS)
+        r_pre = start * 0
+        r_pre_end = tl.minimum(start, rows_i64)
         while r_pre < r_pre_end:
             tl.store(
                 output_ptr + r_pre * HIDDEN_SIZE + hidden,
@@ -882,7 +883,7 @@ def _qwen38_ple_spec_short_conv_kernel(
             r_pre += 1
     if req == NUM_REQS - 1:
         r = end
-        while r < ROWS:
+        while r < rows_i64:
             tl.store(
                 output_ptr + r * HIDDEN_SIZE + hidden,
                 0.0,

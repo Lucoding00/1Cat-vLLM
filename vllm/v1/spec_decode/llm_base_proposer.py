@@ -1195,6 +1195,12 @@ class SpecDecodeBaseProposer:
             and getattr(getattr(self.runner, "input_batch", None), "num_reqs", 0) > 0
             and is_all_chunked_prefill_fn()
         ):
+            if (
+                self.vllm_config.parallel_config.data_parallel_size > 1
+                and self.num_speculative_tokens > 1
+                and not self.parallel_drafting
+            ):
+                self._determine_batch_execution_and_padding(batch_size)
             self._step_profiler.finish(profile_events, "total_gpu", profile_total_start)
             self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "total_wall_cpu", profile_wall_start

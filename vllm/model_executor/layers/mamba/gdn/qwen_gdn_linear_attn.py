@@ -5831,6 +5831,7 @@ def qwen_gdn_input_projection_core(
         z = z_out
     elif (
         getattr(self, "sm70_qwen38_fp16_fused_input", False)
+        and hidden_states.shape[0] in (1, 5, 10)
         and isinstance(self.in_proj_qkvz, LinearBase)
         and isinstance(self.in_proj_ba, LinearBase)
         and use_sm70_decode_graph_semantics(
