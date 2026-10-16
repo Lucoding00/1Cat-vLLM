@@ -681,3 +681,65 @@ PID1=$!
 wait "${PID0}" "${PID1}"
 ```
 随后使用 Nginx / HAProxy（`least_conn` 策略）在 `8000` 端口反向代理 `127.0.0.1:8001` 与 `127.0.0.1:8002` 即可获得完全无锁的 8 卡双副本最大吞吐。
+
+---
+
+### 方案三：单机 `4 × V100 (32GB)`（`TP4 + DCP2 + MTP4 + 256K + 多模态 + 工具调用`）启动命令
+
+如果机器只有 **4 张 V100 (32GB)**，去掉 `--data-parallel-size 2`，直接使用 `--tensor-parallel-size 4 --decode-context-parallel-size 2` 即可刚好占满 4 张卡（`DCP=2` 复用 `TP=4` 的 4 张 GPU，将每张卡的 256K KV Cache 显存占用减半）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next-NVFP4}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+
+# 4 张 V100 32GB
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ==============================================================================
+# 关键配置：关闭默认 Disk-Mmap PLE，消除 Prefill 掉到几千 tok/s 的瓶颈
+# 4 张卡共 4 个 Worker 进程，每个进程固定分配 12 GiB Pinned Host RAM（共 ~48 GiB Host RAM）
+# ==============================================================================
+export VLLM_PLE_CPU_OFFLOAD=0
+export VLLM_PLE_DISK_OFFLOAD=0
+export VLLM_SM70_QWEN38_HYBRID_PLE=0
+export VLLM_QWEN4EXP_PLE_HOST_GIB="${VLLM_QWEN4EXP_PLE_HOST_GIB:-12}"
+
+# （可选：若主机空闲内存 < 64 GiB，请注释上面 4 行并启用下面 5 行，总计仅占 ~14.3 GiB RAM）
+# export VLLM_SM70_QWEN38_HYBRID_PLE=1
+# export VLLM_PLE_CPU_OFFLOAD=1
+# export VLLM_PLE_DISK_OFFLOAD=0
+# export VLLM_PLE_OFFLOAD_PREFAULT=1
+# export VLLM_QWEN4EXP_PLE_HOST_GIB=4
+
+exec vllm serve "${MODEL_PATH}" \
+  --served-model-name Qwen3.8-Flash-Next \
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --decode-context-parallel-size 2 \
+  --dtype half \
+  --kv-cache-dtype auto \
+  --max-model-len 262144 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 4 \
+  --gpu-memory-utilization 0.90 \
+  --no-async-scheduling \
+  --mamba-cache-mode align \
+  --enable-prefix-caching \
+  --no-language-model-only \
+  --limit-mm-per-prompt '{"image":4,"video":0}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
+  --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --seed 0
+```
+
