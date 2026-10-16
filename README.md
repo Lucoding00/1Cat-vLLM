@@ -1162,7 +1162,7 @@ The release test machine had ample host RAM: Flash-Next PLE tables alone total a
 
 ### SM70 `Qwen3.8-Flash-Next` (`qwen4_exp`) Prefill, `MTP4`, and `TP4 + DCP2` Decode Optimizations
 
-Complete design notes, bottleneck breakdown, and per-file unified diffs are documented in [`docs/design/sm70_qwen38_prefill_decode_optimizations.md`](docs/design/sm70_qwen38_prefill_decode_optimizations.md):
+A unified three-in-one master summary consolidating all architectural diagnostics, all 39 optimizations (`P1`–`P13` & `D1`–`D26`), production launch scripts (`4 × V100` and `8 × V100` with `fp8_e4m3` / `auto` KV cache), and merged per-file diffs against `main` is available in [`docs/design/sm70_qwen38_master_summary.md`](docs/design/sm70_qwen38_master_summary.md). Stage-by-stage design notes and diffs are also preserved in [`docs/design/sm70_qwen38_prefill_decode_optimizations.md`](docs/design/sm70_qwen38_prefill_decode_optimizations.md), [`docs/design/sm70_qwen38_capability_breakthroughs.md`](docs/design/sm70_qwen38_capability_breakthroughs.md), and [`docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md`](docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md):
 
 - **Prefill & `MTP4` Bit-Exact Optimizations (`P1`–`P10`)**:
   - **`P1` (`qsa_cache.py`, `indexer_qsa.py`, `ops/qsa.py`)**: Cross-layer `visible_blocks_cache` in `QSAForwardMetadata`, eliminating 11/12 `.item()` host–device syncs and `_qsa_visible_blocks_kernel` launches per prefill chunk.
