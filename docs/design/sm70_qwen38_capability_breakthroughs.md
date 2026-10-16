@@ -1124,6 +1124,205 @@
 +                buffer[:num_rows].copy_(selected)
 ```
 
+### 4.18 `vllm/model_executor/models/qwen3_next.py` (`D26`: `DP2 × TP4` MoE Replica-Local TP Fix)
+
+```diff
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -254,6 +254,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+                     scope="local",
+                 )
+ 
++        keep_replica_local_tp = not (
++            bool(getattr(parallel_config, "enable_expert_parallel", False))
++            or self.is_sequence_parallel
++        )
+         self.experts = FusedMoE(
+             shared_experts=self.shared_expert,
+             gate=self.gate,
+@@ -263,6 +267,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+             intermediate_size=config.moe_intermediate_size,
+             renormalize=getattr(config, "norm_topk_prob", True),
+             quant_config=quant_config,
++            tp_size=self.tp_size if keep_replica_local_tp else None,
++            dp_size=1 if keep_replica_local_tp else None,
++            pcp_size=1 if keep_replica_local_tp else None,
+             prefix=f"{prefix}.experts",
+             enable_eplb=self.enable_eplb,
+             num_redundant_experts=self.n_redundant_experts,
+```
+
+### 4.19 `vllm/v1/spec_decode/llm_base_proposer.py` (`D26`: Align `dummy_run` DP Sync Calls with `propose`)
+
+```diff
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -2443,16 +2443,17 @@ class SpecDecodeBaseProposer:
+             )
+ 
+         for fwd_idx in fwd_indices:
+-            (
+-                cudagraph_runtime_mode,
+-                num_input_tokens,
+-                num_tokens_across_dp,
+-                batch_descriptor,
+-            ) = self._determine_batch_execution_and_padding(
+-                num_tokens, use_cudagraphs=use_cudagraphs
+-            )
++            if fwd_idx <= 1 or is_graph_capturing or spec_step_idx is not None:
++                (
++                    cudagraph_runtime_mode,
++                    num_input_tokens,
++                    num_tokens_across_dp,
++                    base_batch_descriptor,
++                ) = self._determine_batch_execution_and_padding(
++                    num_tokens, use_cudagraphs=use_cudagraphs
++                )
+             batch_descriptor = self._batch_descriptor_for_spec_step(
+-                batch_descriptor, fwd_idx
++                base_batch_descriptor, fwd_idx
+             )
+```
+
+### 4.20 `vllm/v1/worker/gpu_model_runner.py` (`D26`: Keep DP Drafter Sync Balanced on Over-Limit Context)
+
+```diff
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -9172,6 +9172,23 @@ class GPUModelRunner(
+                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+ 
+             if not input_fits_in_drafter:
++                if (
++                    self.vllm_config.parallel_config.data_parallel_size > 1
++                    and (
++                        spec_config.use_eagle()
++                        or spec_config.uses_draft_model()
++                        or spec_config.uses_extract_hidden_states()
++                    )
++                ):
++                    assert isinstance(
++                        self.drafter,
++                        EagleProposer
++                        | DFlashProposer
++                        | DraftModelProposer
++                        | ExtractHiddenStatesProposer
++                        | Gemma4Proposer,
++                    )
++                    self.drafter.dummy_run(1)
+                 # Do not schedule any new drafts once the drafter cannot cover
+                 # the current context. Returning zero-filled draft rows would
+```
+
+### 4.21 `vllm/v1/worker/dp_utils.py` (`D26`: Preserve Per-Replica CUDA Graph Mode & Token Count)
+
+```diff
+--- a/vllm/v1/worker/dp_utils.py
++++ b/vllm/v1/worker/dp_utils.py
+@@ -136,20 +136,28 @@ def _synchronize_dp_ranks(
+         parallel_config=parallel_config,
+     )
+ 
+-    # Synchronize cudagraph_mode across ranks first (take min).
+-    # This is needed before DP padding decision since we use the synced
+-    # cudagraph mode to determine whether DP padding is needed.
+-    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+-
+     # Check conditions for microbatching
+     should_ubatch = _post_process_ubatch(tensor, parallel_config.num_ubatches)
+ 
+-    # DP padding is needed when cudagraph is enabled (synced across ranks)
+-    # or when ubatching/DBO is active (ubatching requires uniform batch
+-    # sizes across DP ranks currently).
+-    # Use the synced runtime cudagraph mode rather than the compilation config
+-    # so we can avoid padding when cudagraph is not enabled for this step.
+-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
++    requires_cross_dp_moe_sync = bool(
++        getattr(parallel_config, "enable_expert_parallel", False)
++        or getattr(parallel_config, "use_sequence_parallel_moe", False)
++    )
++    if requires_cross_dp_moe_sync or should_ubatch:
++        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
++        should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
++    else:
++        synced_cudagraph_mode = cudagraph_mode
++        should_dp_pad = False
+ 
+     # Pad all DP ranks up to the maximum token count across ranks if
+     # should_dp_pad is True
+```
+
+### 4.22 `tests/models/qwen4_exp/test_weight_loading.py` (`D26` Regression Test)
+
+```diff
+--- a/tests/models/qwen4_exp/test_weight_loading.py
++++ b/tests/models/qwen4_exp/test_weight_loading.py
+@@ -470,3 +470,64 @@ def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:
+     Qwen4ExpModel.load_weights(self_stub, iter([]))
+     assert "hyper_connection_mixer." not in captured["skip"]
+     assert "hyper_connection_mixer.block_inject_weight" in captured["skip"]
++
++
++def test_qwen3_next_sparse_moe_keeps_replica_local_tp_under_dp(monkeypatch) -> None:
++    """Under DP>1 with enable_expert_parallel=False, Qwen3NextSparseMoeBlock must
++    pass tp_size=self.tp_size, dp_size=1, pcp_size=1 to FusedMoE so that SM70
++    NVFP4 MoE is not flattened to dp_size * tp_size (e.g. 2 * 4 = 8)."""
++    import vllm.model_executor.models.qwen3_next as qwen3_next_module
++
++    captured_kwargs: dict[str, object] = {}
++
++    class _FakeFusedMoE(torch.nn.Module):
++        def __init__(self, **kwargs):
++            super().__init__()
++            captured_kwargs.update(kwargs)
++
++    class _FakeLinear(torch.nn.Module):
++        def __init__(self, *args, **kwargs):
++            super().__init__()
++
++    monkeypatch.setattr(qwen3_next_module, "FusedMoE", _FakeFusedMoE)
++    monkeypatch.setattr(qwen3_next_module, "ReplicatedLinear", _FakeLinear)
++    monkeypatch.setattr(
++        qwen3_next_module, "get_tensor_model_parallel_world_size", lambda: 4
++    )
++    monkeypatch.setattr(
++        qwen3_next_module,
++        "get_ep_group",
++        lambda: SimpleNamespace(
++            device_group=SimpleNamespace(size=lambda: 8),
++            rank_in_group=0,
++        ),
++    )
++    vllm_config = SimpleNamespace(
++        model_config=SimpleNamespace(
++            hf_text_config=SimpleNamespace(
++                num_experts=512,
++                num_experts_per_tok=10,
++                hidden_size=2048,
++                moe_intermediate_size=512,
++                shared_expert_intermediate_size=0,
++                hidden_act="silu",
++                norm_topk_prob=True,
++            )
++        ),
++        parallel_config=SimpleNamespace(
++            use_sequence_parallel_moe=False,
++            enable_expert_parallel=False,
++            enable_eplb=False,
++            eplb_config=SimpleNamespace(num_redundant_experts=0),
++        ),
++        quant_config=None,
++    )
++    monkeypatch.setattr(
++        qwen3_next_module, "get_current_vllm_config", lambda: vllm_config
++    )
++
++    Qwen3NextSparseMoeBlock(vllm_config, prefix="model.layers.0.mlp")
++    assert captured_kwargs["tp_size"] == 4
++    assert captured_kwargs["dp_size"] == 1
++    assert captured_kwargs["pcp_size"] == 1
+```
+
 ---
 
 ## 5. 验证与回归测试命令
