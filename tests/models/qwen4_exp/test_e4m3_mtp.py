@@ -247,3 +247,40 @@ def test_automatic_e4m3_refuses_unit_scale_fallback(monkeypatch):
         require_calibrated_target=True,
     )
     assert stub._qsa_kv_scales_finalized is True
+
+
+def test_make_draft_vllm_config_honors_speculative_kv_cache_dtype(monkeypatch):
+    from dataclasses import dataclass
+
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    @dataclass
+    class _CacheCfg:
+        cache_dtype: str = E4M3
+
+    @dataclass
+    class _VllmCfg:
+        model_config: object
+        speculative_config: object
+        cache_config: _CacheCfg
+        quant_config: object = None
+        is_speculative_draft: bool = False
+
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: None)
+    target_model = SimpleNamespace(architectures=["Qwen4ExpForCausalLM"])
+    draft_model = SimpleNamespace(architectures=["Qwen4ExpMTP"])
+    spec_cfg = SimpleNamespace(
+        draft_model_config=draft_model,
+        kv_cache_dtype="float16",
+    )
+    target_cfg = _VllmCfg(
+        model_config=target_model,
+        speculative_config=spec_cfg,
+        cache_config=_CacheCfg(cache_dtype=E4M3),
+    )
+
+    draft_cfg = mtp._make_draft_vllm_config(target_cfg, 48)
+    assert draft_cfg.cache_config.cache_dtype == "float16"
+    assert target_cfg.cache_config.cache_dtype == E4M3
+    assert draft_cfg.is_speculative_draft is True
+

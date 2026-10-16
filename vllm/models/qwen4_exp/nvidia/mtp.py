@@ -14,6 +14,9 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
 """
 
 from collections.abc import Iterable
+import copy
+from dataclasses import is_dataclass
+from typing import Any
 
 import regex as re
 import torch
@@ -241,10 +244,26 @@ def _make_draft_vllm_config(
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
 
+    replace_kwargs: dict[str, Any] = {
+        "model_config": speculative_config.draft_model_config,
+        "is_speculative_draft": True,
+    }
+    draft_cache_dtype = getattr(speculative_config, "kv_cache_dtype", None)
+    draft_cache_config = getattr(vllm_config, "cache_config", None)
+    if draft_cache_dtype is not None and draft_cache_config is not None:
+        if is_dataclass(draft_cache_config):
+            draft_cache_config = replace(
+                draft_cache_config,
+                cache_dtype=draft_cache_dtype,
+            )
+        else:
+            draft_cache_config = copy.copy(draft_cache_config)
+            draft_cache_config.cache_dtype = draft_cache_dtype
+        replace_kwargs["cache_config"] = draft_cache_config
+
     draft_vllm_config = replace(
         vllm_config,
-        model_config=speculative_config.draft_model_config,
-        is_speculative_draft=True,
+        **replace_kwargs,
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.

@@ -12,16 +12,16 @@
 | :--- | :--- | :--- |
 | **`docs/design/sm70_qwen38_prefill_decode_optimizations.md`** | **第一阶段（Bit-Exact 算子融合、零拷贝与持久工作区优化）**：涵盖 **`P1`–`P10`**（Prefill & MTP4 10 项优化）与 **`D1`–`D16`**（`TP4 + DCP2` Decode 16 项优化）的详细设计说明与阶段一 Diff。 | **完全可用**（保留第一阶段全部细节） |
 | **`docs/design/sm70_qwen38_capability_breakthroughs.md`** | **第二阶段（能力突破与 `Qwen3.8-27B` vs `Flash-Next` 架构对比）**：涵盖 **`P11`–`P13`** 与 **`D17`–`D26`** 的能力突破、27B 与 Flash-Next 速度差异根因分析，以及阶段二增量 Diff。 | **完全可用**（保留第二阶段全部细节） |
-| **`docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md`** | **第三阶段（8 卡 `DP2 × TP4 + DCP2 + MTP4` 修复与生产启动指南）**：涵盖 `DP2 × TP4` 报错的根因分析、修复代码、一键补丁、4 卡/8 卡启动命令及 `fp8_e4m3` KV Cache 配置。 | **完全可用**（保留部署修复与启动脚本） |
+| **`docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md`** | **第三阶段（8 卡 `DP2 × TP4 + DCP2 + MTP4` 修复与 `fp8_e4m3` 生产启动指南）**：涵盖 `DP2 × TP4` 报错根因与修复（`D26`）、MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）、一键补丁、4 卡/8 卡启动命令。 | **完全可用**（保留部署修复与启动脚本） |
 
 ### 1.2 为什么要将三个文档汇总成本文档（`docs/design/sm70_qwen38_master_summary.md`）？
 由于 `vllm/models/qwen4_exp/nvidia/ops/qsa.py`、`vllm/models/qwen4_exp/nvidia/qsa.py`、`vllm/models/qwen4_exp/nvidia/mtp.py`、`vllm/models/qwen4_exp/nvidia/ple_layer.py`、`vllm/v1/spec_decode/llm_base_proposer.py` 等核心文件在第一、二、三阶段中被**连续迭代增强**，分看三个文档时每个文档展示的是对应阶段的增量 Diff。
 
 因此，本文档将三个文档的全部成果**一次性整合到一个总手册中**：
-- **第 2 节**：四大核心问题与架构根因总结（为什么 `main` 分支 Prefill 只有几千 tok/s、为什么 `27B` Decode 200+ tok/s 而 `Flash-Next` 100+ tok/s、为什么 `DP2 × TP4` 在 `main` 分支报错、以及 `auto` / `fp8_e4m3` / `turboquant_k8v4` 量化选型对比）。
-- **第 3 节**：全量 **39 项优化与修复（`P1`–`P13` + `D1`–`D26`）** 完整对照总表（与 `README.md` 及三个专项文档编号严格一致）。
+- **第 2 节**：四大核心问题与架构根因总结（为什么 `main` 分支 Prefill 只有几千 tok/s、为什么 `27B` Decode 200+ tok/s 而 `Flash-Next` 100+ tok/s、为什么 `DP2 × TP4` 在 `main` 分支报错、以及 `fp8_e4m3` + `MTP4` 草稿 KV dtype 继承链路修复 `D27`）。
+- **第 3 节**：全量 **40 项优化与修复（`P1`–`P13` + `D1`–`D27`）** 完整对照总表（与 `README.md` 及三个专项文档编号严格一致）。
 - **第 4 节**：生产级最佳启动脚本汇总（**`4 × V100 32GB`** 与 **`8 × V100 32GB`**，支持 `256K + 多模态 + 工具调用 + MTP4 + fp8_e4m3 / auto`）。
-- **第 5 节**：相对于 `main` 分支（`be3722bc09`）的 **29 个源码/测试文件最终合并版 Unified Diff**（每个文件只有一份完整合并 Diff，无需跨文档拼接）。
+- **第 5 节**：相对于 `main` 分支（`be3722bc09`）的 **31 个源码/测试文件最终合并版 Unified Diff**（每个文件只有一份完整合并 Diff，无需跨文档拼接）。
 - **第 6 节**：从 `main` 分支一键导出/应用全量补丁命令。
 
 ---
@@ -62,11 +62,11 @@
 1. **权重加载阶段崩溃**：`Qwen3NextSparseMoEBlock` 默认将 `DP2 × TP4` 展平为 `flatten_tp_size = 8`，触发 `NotImplementedError: SM70 TurboMind NVFP4 MoE currently supports tensor parallel sizes (1, 2, 4), plus GLM-5.3 TP8; got 8.`。
 2. **MTP `dummy_run` 与 `propose` 的跨 DP `all_reduce` 次数不匹配**：当 DP0 有请求（调用 `propose()`，内含 2 次跨 DP `all_reduce`）而 DP1 空闲（调用 `dummy_run()`，原本无 `all_reduce`）时，引发跨 DP 死锁。
 3. **跨 DP 同步循环吞没 `cudagraph_mode`**：`dp_utils.py` 原本把 `cudagraph_mode` 参与跨 DP 最小值归约并强制空闲副本循环陪跑，在未开启 EP 时完全多余且会破坏 CUDA Graph 步幅。
-- **修复结论（`D26`）**：仅需修改 4 个核心文件（见第 5.7、5.24、5.25、5.28 节），即可让 `8 × V100` 原生稳定运行 `DP2 × TP4 + DCP2 + MTP4`。
+- **修复结论（`D26`）**：修改 `qwen3_next.py`、`llm_base_proposer.py`、`dp_utils.py`、`gpu_model_runner.py`，即可让 `8 × V100` 原生稳定运行 `DP2 × TP4 + DCP2 + MTP4`。
 
 ---
 
-### 2.4 KV Cache 量化类型选型对比（`auto` vs `fp8_e4m3` vs `turboquant_k8v4`）
+### 2.4 KV Cache 量化选型与 MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）
 
 | `--kv-cache-dtype` 选项 | 实际存储格式（36 层 GDN + 12 层 QSA） | 与 `MTP4` 兼容性 | 显存节省与速度特点 | 推荐场景 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -74,9 +74,19 @@
 | **`auto`**（或 `float16`） | 36 层 GDN + 12 层 QSA 全部使用原生 **FP16（2 bytes/elem）** | 完全兼容 | 零量化/反量化指令开销，短上下文极速 | 对数值精度要求 100% 原生 FP16 的场景 |
 | **`turboquant_k8v4`** | 12 层 QSA 压缩为 **Key INT8 + Value INT4（平均 ~6 bit/elem）** | **不支持与 MTP 同时开启**（`qsa.py:424` 硬性拦截） | 显存压缩率最高（比 FP16 省 ~62.5%），但仅限无 MTP 场景 | 不开 MTP、追求单机最大并发序列数的场景 |
 
+#### 为什么在 `main` 分支指定了 `--speculative-config '{"kv_cache_dtype":"float16"}'` 仍会报 `Loaded 0/2`？（已由 `D27` 修复）
+- **一句话总结**：MTP 草稿模型的 KV cache 数据类型（`dtype`）继承错了，被设成了主模型的 `fp8_e4m3`，而草稿层没有对应的 FP8 缩放因子（`scale`）。
+- **细节链路**：
+  1. 启动参数里，主模型 KV cache 用 `fp8_e4m3`，并明确指定了草稿模型 KV cache 用 `float16`（`--speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'`）。
+  2. 但 `vllm/models/qwen4_exp/nvidia/mtp.py`（及 `amd/mtp.py`）里 `_make_draft_vllm_config()` 函数在构造草稿模型的配置时，用 `replace()` 从主配置整体继承，漏掉了 `speculative_config.kv_cache_dtype="float16"` 这一项。
+  3. 结果草稿模型拿到的 `cache_dtype` 仍是 `fp8_e4m3`。
+  4. 因为草稿 cache 被当成 FP8，加载权重时触发了 `_finalize_qsa_e4m3_scale_load(..., require_calibrated_speculative_draft=True)` 的强制校验，要求草稿层必须有 K/V 的 E4M3 scale。
+  5. 但 checkpoint（模型权重文件）里没有草稿层的 K/V scale → 报 `"Loaded 0/2"` 直接拒绝启动。
+- **修复方式（`D27`）**：在 `_make_draft_vllm_config()` 中检测 `speculative_config.kv_cache_dtype`，若已指定则将其覆盖至 `draft_vllm_config.cache_config.cache_dtype`（详见第 5.8、5.13、5.30 节）。
+
 ---
 
-## 3. 全量 39 项优化与修复总览表（`P1`–`P13` + `D1`–`D26`）
+## 3. 全量 40 项优化与修复总览表（`P1`–`P13` + `D1`–`D27`）
 
 ### 3.1 Prefill 与 `MTP4` 优化（`P1`–`P13`）
 
@@ -98,7 +108,7 @@
 
 ---
 
-### 3.2 `TP4 + DCP2` Decode、`MTP4` 与 `DP2 × TP4` 优化（`D1`–`D26`）
+### 3.2 `TP4 + DCP2` Decode、`MTP4` 与 `DP2 × TP4` 优化（`D1`–`D27`）
 
 | 编号 | 阶段 | 涉及文件 | 优化内容与精确收益 |
 | :--- | :--- | :--- | :--- |
@@ -128,13 +138,14 @@
 | **`D24`** | 阶段二 | `sm70_mtp_fc.py` | 将 MTP Draft 的 `fc_embedding`、`fc_hidden`（4 路 HC）与逐元素相加融合为单个 Triton 内核 `_qwen38_mtp_fc_fused_gemv_add_kernel`，严格保留两次 FP16 舍入边界，每轮省 **8 次算子启动** |
 | **`D25`** | 阶段二 | `mtp.py` | 对 `compact_topk_indices` 共享缓冲去重，为 `B = 1` Decode 新增单行原地 Triton 内核 `_compact_topk_single_row_kernel`，并为 `B > 1` 缓存持久 `_compact_topk_scratch` |
 | **`D26`** | 阶段三 | `qwen3_next.py`, `llm_base_proposer.py`, `gpu_model_runner.py`, `dp_utils.py`, `test_weight_loading.py` | 完整修复 `8 × V100` 下 `DP2 × TP4 + DCP2 + MTP4` 启动崩溃与跨 DP 同步挂起问题 |
+| **`D27`** | 阶段三 | `nvidia/mtp.py`, `amd/mtp.py`, `test_e4m3_mtp.py` | 修复 `_make_draft_vllm_config()` 漏传 `speculative_config.kv_cache_dtype` 导致草稿层误继承主模型 `fp8_e4m3` 并触发 `_finalize_qsa_e4m3_scale_load` 报 `Loaded 0/2` 拒绝启动的问题 |
 
 ---
 
 ## 4. 生产级最佳启动脚本汇总（256K + 多模态 + 工具调用 + MTP4）
 
 ### 4.1 `4 × V100 32GB` 启动脚本（`TP4 + DCP2 + MTP4 + fp8_e4m3`）
-适用于 4 张 V100 32GB，开启 **256K 上下文、多模态、工具调用、MTP4 投机解码、以及 `fp8_e4m3` 主 KV Cache 量化**：
+适用于 4 张 V100 32GB，开启 **256K 上下文、多模态、工具调用、MTP4 投机解码、以及主模型 `fp8_e4m3` + MTP 草稿 `float16` KV Cache**：
 
 ```bash
 #!/usr/bin/env bash
@@ -189,9 +200,6 @@ exec vllm serve "${MODEL_PATH}" \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}' \
   --seed 0
 ```
-> **说明**：
-> - 若权重已含 `mtp.layers.0.self_attn.{k,v}_scale`，可将 `--speculative-config` 写为 `'{"method":"mtp","num_speculative_tokens":4}'`（主模型与 MTP 全部使用 `fp8_e4m3`）。
-> - 若希望使用 FP16 KV Cache，将 `--kv-cache-dtype fp8_e4m3` 改为 `--kv-cache-dtype auto` 并移除 `"kv_cache_dtype":"float16"` 即可。
 
 ---
 
@@ -252,9 +260,9 @@ exec vllm serve "${MODEL_PATH}" \
 
 ---
 
-## 5. 相对于 `main` 分支（`be3722bc09`）的全量代码修改合并 Diff（共 29 个文件）
+## 5. 相对于 `main` 分支（`be3722bc09`）的全量代码修改合并 Diff（共 31 个文件）
 
-以下为本分支所有源码与测试文件相对于 `main` 分支基线（`be3722bc095b9792bf9833068595f0b1ef70ad37`）的**最终合并版 Unified Diff**（已将阶段一 `P1`–`P10`/`D1`–`D16`、阶段二 `P11`–`P13`/`D17`–`D25`、阶段三 `D26` 在同一文件上的修改全部合入一处）：
+以下为本分支所有源码与测试文件相对于 `main` 分支基线（`be3722bc095b9792bf9833068595f0b1ef70ad37`）的**最终合并版 Unified Diff**（已将阶段一 `P1`–`P10`/`D1`–`D16`、阶段二 `P11`–`P13`/`D17`–`D25`、阶段三 `D26`–`D27` 在同一文件上的修改全部合入一处）：
 
 ### 5.1 `csrc/sm70_turbomind/ops/qwen38_ple_spec_sm70.cu` — CUDA 内核：SM70 PLE 多请求 MTP4 投机 Dilated Short-Conv 融合内核（P13 / D20）
 
@@ -846,7 +854,55 @@ index 093f5ce..367a3ed 100644
 
 ---
 
-### 5.8 `vllm/models/qwen4_exp/common/qsa_cache.py` — QSA 跨层 visible_blocks_cache（P1）与 Decode 动态有效 score_columns 边界（D9）
+### 5.8 `vllm/models/qwen4_exp/amd/mtp.py` — AMD MTP _make_draft_vllm_config 正确继承 speculative_config.kv_cache_dtype（D27）
+
+```diff
+diff --git a/vllm/models/qwen4_exp/amd/mtp.py b/vllm/models/qwen4_exp/amd/mtp.py
+index 2c93808..a6aaa33 100644
+--- a/vllm/models/qwen4_exp/amd/mtp.py
++++ b/vllm/models/qwen4_exp/amd/mtp.py
+@@ -14,6 +14,9 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
+ """
+ 
+ from collections.abc import Iterable
++import copy
++from dataclasses import is_dataclass
++from typing import Any
+ 
+ import regex as re
+ import torch
+@@ -171,9 +174,25 @@ def _make_draft_vllm_config(
+                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
+             )
+ 
++    replace_kwargs: dict[str, Any] = {
++        "model_config": speculative_config.draft_model_config,
++    }
++    draft_cache_dtype = getattr(speculative_config, "kv_cache_dtype", None)
++    draft_cache_config = getattr(vllm_config, "cache_config", None)
++    if draft_cache_dtype is not None and draft_cache_config is not None:
++        if is_dataclass(draft_cache_config):
++            draft_cache_config = replace(
++                draft_cache_config,
++                cache_dtype=draft_cache_dtype,
++            )
++        else:
++            draft_cache_config = copy.copy(draft_cache_config)
++            draft_cache_config.cache_dtype = draft_cache_dtype
++        replace_kwargs["cache_config"] = draft_cache_config
++
+     draft_vllm_config = replace(
+         vllm_config,
+-        model_config=speculative_config.draft_model_config,
++        **replace_kwargs,
+     )
+     # VllmConfig post-init derives the target quant config, so restore the
+     # independently resolved draft quant config after replacement.
+```
+
+---
+
+### 5.9 `vllm/models/qwen4_exp/common/qsa_cache.py` — QSA 跨层 visible_blocks_cache（P1）与 Decode 动态有效 score_columns 边界（D9）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
@@ -908,7 +964,7 @@ index f087d0b..b33e090 100644
 
 ---
 
-### 5.9 `vllm/models/qwen4_exp/nvidia/hyperconnection.py` — HyperConnection _hcx_final_mix 原地写入 _mtp_hidden_buffer（P10）
+### 5.10 `vllm/models/qwen4_exp/nvidia/hyperconnection.py` — HyperConnection _hcx_final_mix 原地写入 _mtp_hidden_buffer（P10）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
@@ -945,7 +1001,7 @@ index 6d059d3..3532748 100644
 
 ---
 
-### 5.10 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` — QSA Indexer 持久工作区（D7）、skip_topk 跳过 q_norm/q_rope（D18）与 Key-only 切片投影（D22）
+### 5.11 `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` — QSA Indexer 持久工作区（D7）、skip_topk 跳过 q_norm/q_rope（D18）与 Key-only 切片投影（D22）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
@@ -1132,7 +1188,7 @@ index 0369fac..8d31702 100644
 
 ---
 
-### 5.11 `vllm/models/qwen4_exp/nvidia/model.py` — HC 原地写回（P10）、GDN 免拷贝（D16）、MTP 启用 SM70 Peer 路径（P12 / D19）与修复 hcx final 命名冲突（D21）
+### 5.12 `vllm/models/qwen4_exp/nvidia/model.py` — HC 原地写回（P10）、GDN 免拷贝（D16）、MTP 启用 SM70 Peer 路径（P12 / D19）与修复 hcx final 命名冲突（D21）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
@@ -1218,14 +1274,24 @@ index 2a0ce19..de372a3 100644
 
 ---
 
-### 5.12 `vllm/models/qwen4_exp/nvidia/mtp.py` — MTP 预分配 topk/DCP2 缓冲（P8）、加载权重启用 Peer 路径（P12 / D19）与 compact_topk_indices 去重及单行 Triton 核（D25）
+### 5.13 `vllm/models/qwen4_exp/nvidia/mtp.py` — MTP 预分配 topk/DCP2 缓冲（P8）、启用 Peer 路径（P12 / D19）、compact_topk_indices 单行 Triton 核（D25）与修复草稿 kv_cache_dtype 继承（D27）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
-index 05b7ce3..d296ef8 100644
+index 05b7ce3..0eda2a9 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
 +++ b/vllm/models/qwen4_exp/nvidia/mtp.py
-@@ -73,10 +73,28 @@ from .model import (
+@@ -14,6 +14,9 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
+ """
+ 
+ from collections.abc import Iterable
++import copy
++from dataclasses import is_dataclass
++from typing import Any
+ 
+ import regex as re
+ import torch
+@@ -73,10 +76,28 @@ from .model import (
  )
  from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
  from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
@@ -1254,7 +1320,36 @@ index 05b7ce3..d296ef8 100644
  def _remap_ignored_layers(
      ignored_layers: list[str],
      mtp_start_layer_idx: int,
-@@ -310,6 +328,50 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -223,10 +244,26 @@ def _make_draft_vllm_config(
+                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
+             )
+ 
++    replace_kwargs: dict[str, Any] = {
++        "model_config": speculative_config.draft_model_config,
++        "is_speculative_draft": True,
++    }
++    draft_cache_dtype = getattr(speculative_config, "kv_cache_dtype", None)
++    draft_cache_config = getattr(vllm_config, "cache_config", None)
++    if draft_cache_dtype is not None and draft_cache_config is not None:
++        if is_dataclass(draft_cache_config):
++            draft_cache_config = replace(
++                draft_cache_config,
++                cache_dtype=draft_cache_dtype,
++            )
++        else:
++            draft_cache_config = copy.copy(draft_cache_config)
++            draft_cache_config.cache_dtype = draft_cache_dtype
++        replace_kwargs["cache_config"] = draft_cache_config
++
+     draft_vllm_config = replace(
+         vllm_config,
+-        model_config=speculative_config.draft_model_config,
+-        is_speculative_draft=True,
++        **replace_kwargs,
+     )
+     # VllmConfig post-init derives the target quant config, so restore the
+     # independently resolved draft quant config after replacement.
+@@ -310,6 +347,50 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
          # Phase 2: the drafter shares the target cache_config; remember the main
          # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
          self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
@@ -1305,7 +1400,7 @@ index 05b7ce3..d296ef8 100644
          with set_current_vllm_config(draft_vllm_config, prefix=prefix):
              # residual_linear_shared fusion: fc_embedding projects the token
              # embedding, fc_hidden (shared across HC branches) projects the
-@@ -338,6 +400,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -338,6 +419,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                      draft_vllm_config,
                      layer_type="full_attention",
                      prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
@@ -1316,7 +1411,7 @@ index 05b7ce3..d296ef8 100644
                  )
                  for idx in range(self.num_mtp_layers)
              )
-@@ -387,10 +453,51 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+@@ -387,10 +472,51 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
          """Keep each request's target-aligned step-0 sparse-index row."""
  
          num_rows = row_indices.numel()
@@ -1370,7 +1465,7 @@ index 05b7ce3..d296ef8 100644
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
-@@ -713,7 +820,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+@@ -713,7 +839,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
          # Finalize its calibrated k/v scales strictly from the checkpoint (no
          # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
          # and on the PLE offload process (is_offload_process()).
@@ -1382,7 +1477,7 @@ index 05b7ce3..d296ef8 100644
  
          _finalize_qsa_e4m3_scale_load(
              self,
-@@ -721,6 +831,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+@@ -721,6 +850,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
              self.model._kv_cache_dtype,
              require_calibrated_speculative_draft=True,
          )
@@ -1392,7 +1487,7 @@ index 05b7ce3..d296ef8 100644
 
 ---
 
-### 5.13 `vllm/models/qwen4_exp/nvidia/ops/hc.py` — HyperConnection _hc_combine_norm_impl 支持 out 缓冲原地写回（P10）
+### 5.14 `vllm/models/qwen4_exp/nvidia/ops/hc.py` — HyperConnection _hc_combine_norm_impl 支持 out 缓冲原地写回（P10）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/hc.py b/vllm/models/qwen4_exp/nvidia/ops/hc.py
@@ -1476,7 +1571,7 @@ index c0a8a1d..8668eb1 100644
 
 ---
 
-### 5.14 `vllm/models/qwen4_exp/nvidia/ops/qsa.py` — QSA Split-K/Selector 持久缓冲（D3, D7）、空块短路与 2-warp 启动（D9, D11）、Split-K 融合 DCP 打包（D13）、DCP2 valid_counts 动态裁剪（P11 / D17）与短上下文 IDENTITY_BLOCKS 快路径（D22）
+### 5.15 `vllm/models/qwen4_exp/nvidia/ops/qsa.py` — QSA Split-K/Selector 持久缓冲（D3, D7）、空块短路与 2-warp 启动（D9, D11）、Split-K 融合 DCP 打包（D13）、DCP2 valid_counts 动态裁剪（P11 / D17）与短上下文 IDENTITY_BLOCKS 快路径（D22）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
@@ -2368,7 +2463,7 @@ index aa5e6a6..7d06033 100644
 
 ---
 
-### 5.15 `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py` — DCP2 _qsa_localize_dcp_indices_kernel 半宽存储、物理 KV 槽位融合解析（D2, D10）与 valid_counts 统计（P11 / D17）
+### 5.16 `vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py` — DCP2 _qsa_localize_dcp_indices_kernel 半宽存储、物理 KV 槽位融合解析（D2, D10）与 valid_counts 统计（P11 / D17）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_dcp.py
@@ -2531,7 +2626,7 @@ index 050f072..e76f74c 100644
 
 ---
 
-### 5.16 `vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py` — QSA Pre-Indexer 当 num_q_work == 0 时跳过 q_norm + q_rope（D18）
+### 5.17 `vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py` — QSA Pre-Indexer 当 num_q_work == 0 时跳过 q_norm + q_rope（D18）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
@@ -2565,7 +2660,7 @@ index 3c16955..2aeb8d0 100644
 
 ---
 
-### 5.17 `vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py` — QSA Shared Key Norm 持久输出缓冲复用（D7）
+### 5.18 `vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py` — QSA Shared Key Norm 持久输出缓冲复用（D7）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
@@ -2618,7 +2713,7 @@ index 8b5f9b8..51e7a11 100644
 
 ---
 
-### 5.18 `vllm/models/qwen4_exp/nvidia/ple_layer.py` — PLE 2D 网格短卷积（D15）、行主序 4-tap Triton Prefill 短卷积 + 状态更新、全尺寸 m > 32 N-gram 哈希与多请求投机短卷积（P13 / D20）
+### 5.19 `vllm/models/qwen4_exp/nvidia/ple_layer.py` — PLE 2D 网格短卷积（D15）、行主序 4-tap Triton Prefill 短卷积 + 状态更新、全尺寸 m > 32 N-gram 哈希与多请求投机短卷积（P13 / D20）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
@@ -3634,7 +3729,7 @@ index f1afbd5..092ad09 100644
 
 ---
 
-### 5.19 `vllm/models/qwen4_exp/nvidia/qsa.py` — QSA 3D 门控视图直传（P2）、DCP A2A 融合门控（D1）、跳过冗余清零（D4）、异步 AllGather 重叠 Indexer（D14）、解除 qsa_prep_sm70_out 32 行上限（P12 / D19）与 DCP2 valid_counts 透传（P11 / D17）
+### 5.20 `vllm/models/qwen4_exp/nvidia/qsa.py` — QSA 3D 门控视图直传（P2）、DCP A2A 融合门控（D1）、跳过冗余清零（D4）、异步 AllGather 重叠 Indexer（D14）、解除 qsa_prep_sm70_out 32 行上限（P12 / D19）与 DCP2 valid_counts 透传（P11 / D17）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
@@ -4115,7 +4210,7 @@ index 7826024..c7d9acd 100644
 
 ---
 
-### 5.20 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` — GDN 投影拆分网格缩减（P5）、Key-only index_qk_proj 128×2560 计划（D22）与 shared_expert.down_proj 专用 GEMV 计划（D23）
+### 5.21 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` — GDN 投影拆分网格缩减（P5）、Key-only index_qk_proj 128×2560 计划（D22）与 shared_expert.down_proj 专用 GEMV 计划（D23）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py b/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
@@ -4173,7 +4268,7 @@ index 14b4750..b25d2fe 100644
 
 ---
 
-### 5.21 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py` — MTP Prefill 单次 AllGather 合并 fc（P8）与 Decode 单内核融合 _qwen38_mtp_fc_fused_gemv_add_kernel（D24）
+### 5.22 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py` — MTP Prefill 单次 AllGather 合并 fc（P8）与 Decode 单内核融合 _qwen38_mtp_fc_fused_gemv_add_kernel（D24）
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py b/vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py
@@ -4344,7 +4439,7 @@ index 658f74f..f621be8 100644
 
 ---
 
-### 5.22 `vllm/v1/attention/backends/gdn_attn.py` — GDN Decode 向量化草稿块表展开与延迟计算 num_computed_tokens（D5, D6）
+### 5.23 `vllm/v1/attention/backends/gdn_attn.py` — GDN Decode 向量化草稿块表展开与延迟计算 num_computed_tokens（D5, D6）
 
 ```diff
 diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
@@ -4371,7 +4466,7 @@ index 3fb9816..34f5ce9 100644
 
 ---
 
-### 5.23 `vllm/v1/attention/ops/dcp_alltoall.py` — DCP2 All-to-All LSE 解包合并 + FP16 舍入 + Sigmoid 输出门控融合及打包直传（D1, D13）
+### 5.24 `vllm/v1/attention/ops/dcp_alltoall.py` — DCP2 All-to-All LSE 解包合并 + FP16 舍入 + Sigmoid 输出门控融合及打包直传（D1, D13）
 
 ```diff
 diff --git a/vllm/v1/attention/ops/dcp_alltoall.py b/vllm/v1/attention/ops/dcp_alltoall.py
@@ -4624,7 +4719,7 @@ index 1469a5c..3e37f55 100644
 
 ---
 
-### 5.24 `vllm/v1/spec_decode/llm_base_proposer.py` — Chunked Prefill 中间块提前退出（P7）、接入 index_share_for_mtp_iteration（D18）与 DP2×TP4 dummy_run AllReduce 对齐（D26）
+### 5.25 `vllm/v1/spec_decode/llm_base_proposer.py` — Chunked Prefill 中间块提前退出（P7）、接入 index_share_for_mtp_iteration（D18）与 DP2×TP4 dummy_run AllReduce 对齐（D26）
 
 ```diff
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
@@ -4927,7 +5022,7 @@ index f547596..60391c7 100644
 
 ---
 
-### 5.25 `vllm/v1/worker/dp_utils.py` — DP2 × TP4 独立副本保留各自 cudagraph_mode 与 num_tokens_padded（D26）
+### 5.26 `vllm/v1/worker/dp_utils.py` — DP2 × TP4 独立副本保留各自 cudagraph_mode 与 num_tokens_padded（D26）
 
 ```diff
 diff --git a/vllm/v1/worker/dp_utils.py b/vllm/v1/worker/dp_utils.py
@@ -4978,7 +5073,7 @@ index e7c6d81..0ecc574 100644
 
 ---
 
-### 5.26 `vllm/v1/worker/gpu/cudagraph_utils.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
+### 5.27 `vllm/v1/worker/gpu/cudagraph_utils.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
 
 ```diff
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
@@ -5000,7 +5095,7 @@ index 1b04912..adf13da 100644
 
 ---
 
-### 5.27 `vllm/v1/worker/gpu/model_runner.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
+### 5.28 `vllm/v1/worker/gpu/model_runner.py` — 仅对 MLA 模型准备 dcp_local_seq_lens（D12）
 
 ```diff
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
@@ -5020,7 +5115,7 @@ index 324b32e..7f46a44 100644
 
 ---
 
-### 5.28 `vllm/v1/worker/gpu_model_runner.py` — Chunked Prefill MTP 提前退出配合（P7）、跳过非 MLA dcp_local_seq_lens（D12）与 DP2×TP4 禁用跨 DP dummy 死循环（D26）
+### 5.29 `vllm/v1/worker/gpu_model_runner.py` — Chunked Prefill MTP 提前退出配合（P7）、跳过非 MLA dcp_local_seq_lens（D12）与 DP2×TP4 禁用跨 DP dummy 死循环（D26）
 
 ```diff
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
@@ -5085,7 +5180,59 @@ index 001204b..9c66cac 100644
 
 ---
 
-### 5.29 `tests/models/qwen4_exp/test_weight_loading.py` — 单测：验证 Qwen3NextForCausalLM 在 DP2×TP4 下保持副本内局部 MoE TP=4（D26）
+### 5.30 `tests/models/qwen4_exp/test_e4m3_mtp.py` — 单测：验证 _make_draft_vllm_config 正确应用 speculative_config.kv_cache_dtype（D27）
+
+```diff
+diff --git a/tests/models/qwen4_exp/test_e4m3_mtp.py b/tests/models/qwen4_exp/test_e4m3_mtp.py
+index 5d341e8..7a0daf5 100644
+--- a/tests/models/qwen4_exp/test_e4m3_mtp.py
++++ b/tests/models/qwen4_exp/test_e4m3_mtp.py
+@@ -247,3 +247,40 @@ def test_automatic_e4m3_refuses_unit_scale_fallback(monkeypatch):
+         require_calibrated_target=True,
+     )
+     assert stub._qsa_kv_scales_finalized is True
++
++
++def test_make_draft_vllm_config_honors_speculative_kv_cache_dtype(monkeypatch):
++    from dataclasses import dataclass
++
++    from vllm.models.qwen4_exp.nvidia import mtp
++
++    @dataclass
++    class _CacheCfg:
++        cache_dtype: str = E4M3
++
++    @dataclass
++    class _VllmCfg:
++        model_config: object
++        speculative_config: object
++        cache_config: _CacheCfg
++        quant_config: object = None
++        is_speculative_draft: bool = False
++
++    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: None)
++    target_model = SimpleNamespace(architectures=["Qwen4ExpForCausalLM"])
++    draft_model = SimpleNamespace(architectures=["Qwen4ExpMTP"])
++    spec_cfg = SimpleNamespace(
++        draft_model_config=draft_model,
++        kv_cache_dtype="float16",
++    )
++    target_cfg = _VllmCfg(
++        model_config=target_model,
++        speculative_config=spec_cfg,
++        cache_config=_CacheCfg(cache_dtype=E4M3),
++    )
++
++    draft_cfg = mtp._make_draft_vllm_config(target_cfg, 48)
++    assert draft_cfg.cache_config.cache_dtype == "float16"
++    assert target_cfg.cache_config.cache_dtype == E4M3
++    assert draft_cfg.is_speculative_draft is True
++
+```
+
+---
+
+### 5.31 `tests/models/qwen4_exp/test_weight_loading.py` — 单测：验证 Qwen3NextForCausalLM 在 DP2×TP4 下保持副本内局部 MoE TP=4（D26）
 
 ```diff
 diff --git a/tests/models/qwen4_exp/test_weight_loading.py b/tests/models/qwen4_exp/test_weight_loading.py
@@ -5163,7 +5310,7 @@ index f8eb0ea..be6fcee 100644
 
 ## 6. 一键导出或应用全量补丁命令
 
-如果您需要将本分支的全部 39 项优化与 `DP2 × TP4` 修复一次性导出为单个 `.patch` 文件并应用到任何干净的 `main` 分支，可直接运行：
+如果您需要将本分支的全部 40 项优化与修复（`P1`–`P13` + `D1`–`D27`）一次性导出为单个 `.patch` 文件并应用到任何干净的 `main` 分支，可直接运行：
 
 ```bash
 # 在当前分支导出仅包含源码与单测的完整补丁

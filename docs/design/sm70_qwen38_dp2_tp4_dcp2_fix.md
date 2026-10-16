@@ -757,10 +757,63 @@ exec vllm serve "${MODEL_PATH}" \
    ```
 
 2. **写法 B（通用稳妥写法：主模型 12 层用 `fp8_e4m3`，MTP 1 层保持 `float16`）**：
-   如果权重中没有 `mtp.layers.0.self_attn.{k,v}_scale`（直接开 `fp8_e4m3` 会报 `QSA E4M3 speculative draft scale overlay is incomplete`），可以在 `--speculative-config` 中单独指定 Draft KV 为 `"float16"`（`vllm/v1/spec_decode/llm_base_proposer.py:2100` 与 `vllm/v1/core/kv_cache_utils.py:1099` 原生支持主模型 E4M3 + Draft FP16 混布）：
+   如果权重中没有 `mtp.layers.0.self_attn.{k,v}_scale`（直接开 `fp8_e4m3` 会报 `QSA E4M3 speculative draft scale overlay is incomplete: loaded 0/2 scale tensors.`），可以在 `--speculative-config` 中单独指定 Draft KV 为 `"float16"`：
    ```bash
    --kv-cache-dtype fp8_e4m3 \
    --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'
    ```
+
+### 5.1 为什么在 `main` 分支上传了 `"kv_cache_dtype":"float16"` 仍会报 `Loaded 0/2`？（根因与修复 `D27`）
+
+- **问题链路**：
+  1. 启动参数指定主模型 `--kv-cache-dtype fp8_e4m3`，并在 `--speculative-config` 中指定 `"kv_cache_dtype":"float16"`。
+  2. 但在 `vllm/models/qwen4_exp/nvidia/mtp.py`（及 `amd/mtp.py`）的 `_make_draft_vllm_config()` 中，构造草稿模型的 `draft_vllm_config` 时直接调用了 `replace(vllm_config, model_config=speculative_config.draft_model_config, is_speculative_draft=True)`，**漏掉了将 `speculative_config.kv_cache_dtype` 覆盖到 `draft_vllm_config.cache_config.cache_dtype`**。
+  3. 导致 `Qwen4ExpMultiTokenPredictor` 的 `self._kv_cache_dtype` 与草稿层 `Qwen4ExpQSAAttention` 仍然继承了主模型的 `"fp8_e4m3"`。
+  4. 随后 `Qwen4ExpMTP.load_weights()` 触发 `_finalize_qsa_e4m3_scale_load(..., require_calibrated_speculative_draft=True)`，強制要求 checkpoint 中存在草稿层 `mtp.layers.0.self_attn.{k,v}_scale`，因 checkpoint 不含该权重而报 `Loaded 0/2` 拒绝启动。
+
+- **修复代码（`vllm/models/qwen4_exp/nvidia/mtp.py` 与 `vllm/models/qwen4_exp/amd/mtp.py`）**：
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -15,6 +15,9 @@
+ """
+ 
+ from collections.abc import Iterable
++import copy
++from dataclasses import is_dataclass
++from typing import Any
+ 
+ import regex as re
+ import torch
+@@ -241,10 +244,25 @@ def _make_draft_vllm_config(
+                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
+             )
+ 
++    replace_kwargs: dict[str, Any] = {
++        "model_config": speculative_config.draft_model_config,
++        "is_speculative_draft": True,
++    }
++    draft_cache_dtype = getattr(speculative_config, "kv_cache_dtype", None)
++    draft_cache_config = getattr(vllm_config, "cache_config", None)
++    if draft_cache_dtype is not None and draft_cache_config is not None:
++        if is_dataclass(draft_cache_config):
++            draft_cache_config = replace(
++                draft_cache_config,
++                cache_dtype=draft_cache_dtype,
++            )
++        else:
++            draft_cache_config = copy.copy(draft_cache_config)
++            draft_cache_config.cache_dtype = draft_cache_dtype
++        replace_kwargs["cache_config"] = draft_cache_config
++
+     draft_vllm_config = replace(
+         vllm_config,
+-        model_config=speculative_config.draft_model_config,
+-        is_speculative_draft=True,
++        **replace_kwargs,
+     )
+```
+
 
 
