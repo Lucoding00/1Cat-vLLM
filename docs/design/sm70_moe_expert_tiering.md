@@ -100,6 +100,9 @@ H2D/D2H 用 PyTorch 测，每张卡的 pinned 缓冲由绑在该卡 NUMA 节点�
 
 ```bash
 # 先停掉占用 GPU 的服务
+# 纯 shell 版：只需要 bash + gcc + NVIDIA 驱动（libcuda.so.1），不需要 Python/torch/nvcc
+bash benchmarks/sm70_host_probe.sh --pin-gib 96
+# 或者 Python 版（需要 vLLM 环境里的 torch）
 python benchmarks/sm70_host_topology_probe.py --pin-test-gib 96 --json-out host_topology.json
 # 输出里的 recommended 直接作为 analyze 的 --cpu-bw-gbs / --pcie-gbs-per-gpu
 ```
