@@ -258,7 +258,9 @@ class CostModel:
     moe_intermediate_size: int = 2048
     tp: int = 4
     pp: int = 2
-    cpu_bw_gbs: float = 150.0  # usable host DRAM bandwidth shared by a stage
+    # Usable DRAM bandwidth of the socket serving the active stage. With TP4/PP2
+    # each stage maps to one NUMA node; single-request stages run in turn.
+    cpu_bw_gbs: float = 100.0
     pcie_gbs_per_gpu: float = 6.0  # H2D per GPU while its switch peer also copies
     handoff_us_per_layer: float = 40.0  # D2H route + CPU wake + H2D partial
     baseline_tpot_ms: float = 18.86  # measured GLM-5.3 TP4/PP2 no-MTP decode
@@ -546,7 +548,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ana.add_argument("--moe-intermediate-size", type=int, default=2048)
     ana.add_argument("--tp", type=int, default=4)
     ana.add_argument("--pp", type=int, default=2)
-    ana.add_argument("--cpu-bw-gbs", type=float, default=150.0)
+    ana.add_argument("--cpu-bw-gbs", type=float, default=100.0)
     ana.add_argument("--pcie-gbs-per-gpu", type=float, default=6.0)
     ana.add_argument("--handoff-us", type=float, default=40.0)
     ana.add_argument("--baseline-tpot-ms", type=float, default=18.86)

@@ -47,17 +47,52 @@ prefill “几十 K tok/s” 仍受 8×V100 FP16 算力约束（理论上限约 
   `tp × Σ_layer misses × shard` 字节；再加每层一次交接开销（D2H 路由与 hidden、CPU 唤醒、H2D 部分和）。
 - prefill：每张卡每个 chunk 拷入 `Σ_layer 未缓存且被触及的专家 × shard`。chunk ≥ 1K 时 288 个专家
   几乎全被触及，所以每个 chunk 的拷贝量约等于全部未缓存专家，与 chunk 大小无关，chunk 越大摊得越薄。
-- 默认值：主机内存带宽 150 GB/s（双路 DDR4 实际可用），PCIe 3.0 每卡 6 GB/s（两卡共用一个 switch），
+- 默认值：主机内存带宽 100 GB/s（一个 socket 的 6 通道 DDR4 实际可用；TP4/PP2 单请求时两个 stage
+  轮流工作，同一时刻只有一个 socket 在算），PCIe 3.0 每卡 6 GB/s（两卡共用一个 switch），
   交接 40 µs/层，基线 TPOT 18.86 ms。
 
 合成 Zipf(0.9) 路由下的示例输出（仅演示工具，不代表真实分布）：
 
 | 缓存比例 | 释放 GiB/卡 | decode 命中率 | 估计 decode tok/s | 每 2K chunk 拷贝 s | 拷贝约束的 prefill 上限 |
 |---:|---:|---:|---:|---:|---:|
-| 50% | 9.97 | 84.3% | 39.2 | 1.78 | 约 1,150 tok/s（2K chunk） |
-| 70% | 5.95 | 91.8% | 43.2 | 1.07 | 约 1,920 tok/s（2K chunk） |
+| 50% | 9.93 | 84.3% | 35.7 | 1.79 | 约 1,140 tok/s（2K chunk） |
+| 70% | 5.97 | 91.7% | 40.9 | 1.07 | 约 1,910 tok/s（2K chunk） |
+| 80% | 3.98 | 94.8% | 43.4 | 0.71 | 约 2,870 tok/s（2K chunk） |
 
 chunk 为 16K 时，同样的拷贝量对应的上限是上表的 8 倍，因此大 chunk 必不可少。
+
+### 3.1 目标机器拓扑（2026-10-16 `nvidia-smi topo -m`）
+
+- 8×V100-SXM2，NVLink 混合立方体拓扑：GPU0–3 两两直连，GPU4–7 两两直连（NV1/NV2）；
+  跨组只有 0↔4、1↔5、2↔6、3↔7 各一条 NV1，其余跨组访问走 SYS（PCIe + UPI）。
+- 双路 CPU，每路 18 核 36 线程。GPU0–3 属于 NUMA0（CPU 0–17、36–53），GPU4–7 属于 NUMA1（CPU 18–35、54–71）。
+- mlx5_0 与 GPU2/3 挂在同一个 PCIe switch 下（PIX）。按常见 SXM2 主板推测，每两张 GPU 共享一个 x16 上行口，
+  需要实测确认。
+
+对分层的含义：
+
+- **TP4/PP2 与硬件天然对齐**：vLLM 的 rank = pp_rank × tp + tp_rank，所以 PP0 = GPU0–3（NUMA0），
+  PP1 = GPU4–7（NUMA1）。TP 组内全 NVLink 直连；PP 交接是 GPU i → GPU i+4（同一 tp_rank 一一对应），正好就是那 4 条跨组直连 NVLink。
+- **每个 stage 的专家放在自己的 NUMA 节点**：每个 stage 主机副本约 79.7 GiB（21 层 × 288 × 4 个分片 × 3.54 MB），
+  每个节点 256 GB 内存放得下单份。双份布局（约 160 GiB/节点）也放得下，但余量偏紧，建议只保留一份。
+  这样 CPU 计算和 H2D 都只访问本节点内存，不经过 UPI。
+- **worker 必须绑核**：rank 0–3 绑 NUMA0，rank 4–7 绑 NUMA1；pinned 缓冲在绑核之后分配（first-touch），
+  确保落在本节点。每个 rank 约分到 4 个物理核，一个 socket 的 18 核可以吃满本节点内存带宽。
+- **带宽假设**：单请求 decode 时两个 stage 轮流工作，CPU 侧有效带宽按一个 socket 计（默认 100 GB/s）。
+  多请求流水时，两个 socket 可以同时工作。prefill 流式传输按每卡 6 GB/s 估计（两卡共享上行口）。
+- **TP8**：跨组 all-reduce 要经过不完全连通的 NVLink，并且跨 NUMA 节点，所以分层方案优先针对 TP4/PP2。
+
+建议在目标机器上实测：
+
+```bash
+lscpu | grep -o 'avx512[a-z_]*' | sort -u          # 确认 AVX-512 子集（决定 CPU kernel 写法）
+numactl -H                                          # 每个节点的内存大小
+sudo dmidecode -t memory | grep -E 'Speed|Size' | sort | uniq -c   # DDR4 频率和通道数
+# 每个 socket 的实际带宽（STREAM 或 mlc）
+numactl --cpunodebind=0 --membind=0 ./stream
+# 8 卡同时 H2D 的带宽（确认每两卡共享上行口的情况）
+nvbandwidth -t host_to_device_memcpy_ce
+```
 
 ## 4. 运行时设计
 
@@ -147,7 +182,7 @@ python benchmarks/sm70_moe_expert_tiering.py collect \
 
 # 3) 分析：按 TP4/PP2 的分片大小和你机器的带宽假设估算
 python benchmarks/sm70_moe_expert_tiering.py analyze glm_routes.npz \
-  --moe-layers 3-44 --tp 4 --pp 2 --cpu-bw-gbs 150 --pcie-gbs-per-gpu 6 \
+  --moe-layers 3-44 --tp 4 --pp 2 --cpu-bw-gbs 100 --pcie-gbs-per-gpu 6 \
   --chunk-tokens 2048,8192,16384 --json-out tiering_report.json
 ```
 
