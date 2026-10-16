@@ -82,16 +82,26 @@ chunk 为 16K 时，同样的拷贝量对应的上限是上表的 8 倍，因此
   多请求流水时，两个 socket 可以同时工作。prefill 流式传输按每卡 6 GB/s 估计（两卡共享上行口）。
 - **TP8**：跨组 all-reduce 要经过不完全连通的 NVLink，并且跨 NUMA 节点，所以分层方案优先针对 TP4/PP2。
 
-建议在目标机器上实测：
+CPU 指令集（`lscpu` 实测）：AVX-512 F/CD/DQ/BW/VL，**没有** VNNI、VBMI、BF16、FP16，
+可以判断是 Skylake-SP（Xeon Gold 61xx，每 socket 6 通道 DDR4-2666，理论 128 GB/s）。对 CPU kernel 的影响：
+
+- E2M1 只有 16 个码值，正好用一条 `vpermps zmm`（`_mm512_permutexvar_ps`，AVX-512F）从 16 项 FP32 表直接查出，
+  不需要 VBMI 的 `vpermb`；
+- E4M3 block scale 每 16 个权重只有一个，用 256 项 FP32 表查；global scale 合并进去；
+- 激活和输出用 F16C（`vcvtph2ps`/`vcvtps2ph`）在 FP16 与 FP32 之间转换，FP32 FMA 累加；
+- 没有 VNNI，不走 int8 点积路线；这个 kernel 受内存带宽限制，FP32 FMA 的算力绰绰有余；
+- 运行 AVX-512 时核心会降频，以实测为准。
+
+目标机器没有 root、`numactl` 和 `nvbandwidth`，所以用 `benchmarks/sm70_host_topology_probe.py` 实测：
+拓扑从 `/sys` 读取；内存带宽用“每个物理核一个进程 + `sched_setaffinity` + first-touch”测量；
+H2D/D2H 用 PyTorch 测，每张卡的 pinned 缓冲由绑在该卡 NUMA 节点上的线程分配。
+测试场景包括单卡、同 switch 疑似对（0,1）、跨 switch 对（0,2）、每个节点 4 卡、8 卡同时。
+`--pin-test-gib` 会检查非 root 账户每个节点实际能锁住多少 pinned 内存。
 
 ```bash
-lscpu | grep -o 'avx512[a-z_]*' | sort -u          # 确认 AVX-512 子集（决定 CPU kernel 写法）
-numactl -H                                          # 每个节点的内存大小
-sudo dmidecode -t memory | grep -E 'Speed|Size' | sort | uniq -c   # DDR4 频率和通道数
-# 每个 socket 的实际带宽（STREAM 或 mlc）
-numactl --cpunodebind=0 --membind=0 ./stream
-# 8 卡同时 H2D 的带宽（确认每两卡共享上行口的情况）
-nvbandwidth -t host_to_device_memcpy_ce
+# 先停掉占用 GPU 的服务
+python benchmarks/sm70_host_topology_probe.py --pin-test-gib 96 --json-out host_topology.json
+# 输出里的 recommended 直接作为 analyze 的 --cpu-bw-gbs / --pcie-gbs-per-gpu
 ```
 
 ## 4. 运行时设计
@@ -147,7 +157,7 @@ mixed batch（decode + prefill 混在一步）按总 M 选择路径；也可以�
 | `vllm/model_executor/layers/fused_moe/sm70/fp4_codec.py`、`fp4_stages.py` | `Fp4MoECodec` 借用 layer 上的 bank 与指针表；在这里加入缓存槽和窗口指针 |
 | `vllm/model_executor/layers/fused_moe/routed_experts_capturer.py` 和 `--enable-return-routed-experts` | 上游已有的逐 token 路由导出，Phase 0 直接复用，不改运行时 |
 | `vllm/model_executor/offloader/prefetch.py` | 现有的逐层整块预取卸载。它按参数整体搬运，不懂“热专家子集 + CPU 计算”，可以借鉴其静态缓冲和事件分叉，但不能直接复用 |
-| `csrc/`（新增） | AVX-512/AVX2 NVFP4 专家 GEMV：E2M1 查表、E4M3 scale 转 FP32、FP32 累加；按 rank 绑核、按 NUMA 绑内存 |
+| `csrc/`（新增） | AVX-512F NVFP4 专家 GEMV：`vpermps` 查 E2M1、查表转换 E4M3 scale、F16C 处理激活、FP32 FMA；按 rank 绑核，按 NUMA first-touch 分配内存（见 3.1） |
 
 ## 6. 分阶段计划
 
@@ -164,7 +174,8 @@ mixed batch（decode + prefill 混在一步）按总 M 选择路径；也可以�
 - **质量**：CPU 用 FP32 累加，GPU 用 FP16 舍入，结果不会逐位一致。需要沿用本仓库的数据集审计（GSM8K、低 margin token 检查），尤其是 DFlash 的接受率。
 - **命中率未知**：GLM 只有 288 个专家，每个专家较大，路由分布可能比 Flash-Next（512 个小专家）更平。Phase 0 必须在真实负载上测，合成数据不能代替。
 - **PCIe 拓扑**：V100 平台是 PCIe 3.0，两卡共享一个 switch 时每卡约 6 GB/s；跨 socket 访问还要经过 UPI。需要用 `nvidia-smi topo -m` 确认拓扑。
-- **pinned 内存**：注册约 160–320 GiB 需要调整 `ulimit -l`，启动时触页耗时可能达分钟级。
+- **pinned 内存**：每个节点约 80 GiB。非 root 账户无法提高 `ulimit -l`。`cudaHostAlloc` 由驱动分配，
+  通常不受这个限制，但需要用 `--pin-test-gib` 实测确认；启动时触页可能需要分钟级时间。
 - **PP 与采集**：使用 PP 时，路由采集可能只覆盖部分 stage。工具会自动识别没有写入的层；建议用 TP8/PP1 做标定。
 
 ## 8. Phase 0 使用方法
