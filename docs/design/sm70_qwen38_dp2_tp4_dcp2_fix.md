@@ -743,3 +743,24 @@ exec vllm serve "${MODEL_PATH}" \
   --seed 0
 ```
 
+---
+
+## 5. 开启 `--kv-cache-dtype fp8_e4m3` 的启动配置说明
+
+如果您希望将 QSA 主 KV Cache 从 FP16（`auto`）切换为 **`fp8_e4m3`**（使 12 层主模型 QSA KV 显存占用与访存带宽再降 50%），可以根据模型权重是否包含 `mtp.layers.0.self_attn.{k,v}_scale` 选择以下两种写法：
+
+1. **写法 A（权重自带完整 26 个校准 scale，即主模型 12 层 + MTP 1 层）**：
+   直接将 `--kv-cache-dtype auto` 改为 `--kv-cache-dtype fp8_e4m3`：
+   ```bash
+   --kv-cache-dtype fp8_e4m3 \
+   --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+   ```
+
+2. **写法 B（通用稳妥写法：主模型 12 层用 `fp8_e4m3`，MTP 1 层保持 `float16`）**：
+   如果权重中没有 `mtp.layers.0.self_attn.{k,v}_scale`（直接开 `fp8_e4m3` 会报 `QSA E4M3 speculative draft scale overlay is incomplete`），可以在 `--speculative-config` 中单独指定 Draft KV 为 `"float16"`（`vllm/v1/spec_decode/llm_base_proposer.py:2100` 与 `vllm/v1/core/kv_cache_utils.py:1099` 原生支持主模型 E4M3 + Draft FP16 混布）：
+   ```bash
+   --kv-cache-dtype fp8_e4m3 \
+   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'
+   ```
+
+
