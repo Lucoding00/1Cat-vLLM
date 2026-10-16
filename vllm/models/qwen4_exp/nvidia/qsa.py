@@ -165,7 +165,11 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
                     expansion, dtype=table.dtype, device=table.device
                 ).view(1, 1, expansion)
                 self._draft_sub_block_offsets = sub_block_offsets
-            torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)
+            torch.mul(
+                table.unsqueeze(-1).expand(rows, columns, expansion),
+                expansion,
+                out=expanded_view,
+            )
             expanded_view.add_(sub_block_offsets)
             common_attn_metadata = common_attn_metadata.replace(
                 block_table_tensor=expanded

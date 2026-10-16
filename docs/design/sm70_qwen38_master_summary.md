@@ -3733,10 +3733,10 @@ index f1afbd5..092ad09 100644
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
-index 7826024..c7d9acd 100644
+index 7826024..43dea07 100644
 --- a/vllm/models/qwen4_exp/nvidia/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/qsa.py
-@@ -153,10 +153,20 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
+@@ -153,10 +153,24 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
              ):
                  raise RuntimeError("QSA draft block-table buffer is too small")
              expanded = self.draft_block_table_buffer[:rows, : columns * expansion]
@@ -3756,12 +3756,16 @@ index 7826024..c7d9acd 100644
 +                    expansion, dtype=table.dtype, device=table.device
 +                ).view(1, 1, expansion)
 +                self._draft_sub_block_offsets = sub_block_offsets
-+            torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)
++            torch.mul(
++                table.unsqueeze(-1).expand(rows, columns, expansion),
++                expansion,
++                out=expanded_view,
++            )
 +            expanded_view.add_(sub_block_offsets)
              common_attn_metadata = common_attn_metadata.replace(
                  block_table_tensor=expanded
              )
-@@ -258,6 +268,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -258,6 +272,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          output_scale: torch.Tensor | None = None,
          output_block_scale: torch.Tensor | None = None,
          dense_short_context: bool = False,
@@ -3769,7 +3773,7 @@ index 7826024..c7d9acd 100644
      ) -> torch.Tensor:
          del key, value
          if output_scale is not None or output_block_scale is not None:
-@@ -268,10 +279,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -268,10 +283,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              raise NotImplementedError("QSA does not support sliding-window attention")
  
          num_tokens = attn_metadata.num_actual_tokens
@@ -3788,7 +3792,7 @@ index 7826024..c7d9acd 100644
          else:
              output.zero_()
          if num_tokens == 0:
-@@ -300,9 +315,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -300,9 +319,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              return output
          # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
          # [num_blocks, 2, block_size, num_kv_heads, head_size].
@@ -3807,7 +3811,7 @@ index 7826024..c7d9acd 100644
          if query.dtype not in (torch.float16, torch.bfloat16):
              raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
          if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-@@ -348,6 +369,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -348,6 +373,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                  token_to_req,
                  output[:num_tokens],
                  output_gate[:num_tokens],
@@ -3815,7 +3819,7 @@ index 7826024..c7d9acd 100644
              )
              return output
  
-@@ -373,6 +395,92 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -373,6 +399,92 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          )
          return output
  
@@ -3908,7 +3912,7 @@ index 7826024..c7d9acd 100644
      def _forward_qsa_dcp(
          self,
          layer: torch.nn.Module,
-@@ -384,8 +492,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -384,8 +496,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          token_to_req: torch.Tensor,
          output: torch.Tensor,
          output_gate: torch.Tensor,
@@ -3922,7 +3926,7 @@ index 7826024..c7d9acd 100644
  
          from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
          from .ops.qsa_dcp import (
-@@ -405,33 +518,73 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -405,33 +522,73 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              )
          ):
              raise RuntimeError("QSA DCP target workspaces are not initialized")
@@ -4010,7 +4014,7 @@ index 7826024..c7d9acd 100644
              block_table,
              token_to_req,
              partial_output,
-@@ -439,7 +592,23 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -439,7 +596,23 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              k_scale=layer._k_scale_float,
              v_scale=layer._v_scale_float,
              lse=partial_lse,
@@ -4034,7 +4038,7 @@ index 7826024..c7d9acd 100644
          merged = cast(
              torch.Tensor,
              self.dcp_combine(
-@@ -453,7 +622,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -453,7 +626,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          # apply the Triton gate DCP1's page4 route uses. This replaces a chain
          # of five elementwise kernels (12.2 us per decode layer on V100).
          output.copy_(merged)
@@ -4043,7 +4047,7 @@ index 7826024..c7d9acd 100644
  
  
  def _verify_e4m3_kv_requirements(
-@@ -862,6 +1031,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -862,6 +1035,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          self,
          qkv: torch.Tensor,
          positions: torch.Tensor,
@@ -4052,7 +4056,7 @@ index 7826024..c7d9acd 100644
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
          """Split, normalize, and rotate Q/K using this tree's Qwen3 API."""
          q_gate, key, value = qkv.split(
-@@ -875,7 +1046,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -875,7 +1050,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              key.view(*token_shape, self.num_kv_heads, self.head_dim)
          ).reshape(*token_shape, self.kv_size)
          query, key = self.rotary_emb(positions, query, key)
@@ -4063,7 +4067,7 @@ index 7826024..c7d9acd 100644
  
      def _use_dense_short_context(
          self, num_tokens: int, side_metadata: QSAForwardMetadata
-@@ -956,34 +1129,53 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -956,34 +1133,53 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  value[:num_tokens],
              )
          dense = self._use_dense_short_context(num_tokens, side_metadata)
@@ -4138,7 +4142,7 @@ index 7826024..c7d9acd 100644
                  self.rotary_emb.cos_sin_cache,
                  self.q_norm.weight,
                  self.k_norm.weight,
-@@ -991,7 +1183,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -991,7 +1187,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  prepared,
                  key_cache,
                  value_cache,
@@ -4147,7 +4151,7 @@ index 7826024..c7d9acd 100644
              )
              query = key = value = prepared
          else:
-@@ -1002,6 +1194,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1002,6 +1198,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  self.kv_cache,
                  main_metadata.slot_mapping,
              )
@@ -4174,7 +4178,7 @@ index 7826024..c7d9acd 100644
          impl.forward_qsa(
              self,
              query,
-@@ -1015,6 +1227,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1015,6 +1231,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              query_positions=side_metadata.logical_positions,
              sequence_lengths=side_metadata.seq_lens,
              dense_short_context=dense,
@@ -4182,7 +4186,7 @@ index 7826024..c7d9acd 100644
          )
          _sm70_dump_qwen_layer_tensor(
              "qsa_core_out",
-@@ -1037,18 +1250,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1037,18 +1254,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              qkv, indexer_input = side(hidden_states)
          else:
              qkv, _ = self.qkv_proj(hidden_states)
