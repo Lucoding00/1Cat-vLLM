@@ -14,6 +14,7 @@
 | `docs/design/sm70_qwen38_dp2_tp4_dcp2_fix.md` | **第三阶段：`DP2 × TP4` 修复、启动脚本与 `fp8_e4m3` 指南** | `D26` + `D27` + 4 卡/8 卡 256K 生产启动脚本 |
 | `docs/design/sm70_qwen38_mtp_draft_kv_cache_dtype_fix.md` | **专项修复 1：MTP 草稿 `kv_cache_dtype` 继承修复（`D27`）** | 解决 `--kv-cache-dtype fp8_e4m3` 下草稿层误继承 `fp8_e4m3` 报 `Loaded 0/2` |
 | `docs/design/sm70_qwen38_qsa_draft_block_table_resize_fix.md` | **专项修复 2：QSA 草稿块表 `out=` 隐式缩容修复（`D28`）** | 解决 `torch.mul(table.unsqueeze(-1), expansion, out=expanded_view)` 隐式缩容报错 |
+| `docs/design/sm70_qwen38_commit_048ac68_readme.md` | **专项修复 3（Commit `048ac68`）：`indexer_qsa` 导入、`IDENTITY_BLOCKS` 顺序与 `fp8_e4m3` `"duct"` 乱码排查** | `indexer_qsa.py` 导入修正、`ops/qsa.py` `IDENTITY_BLOCKS` 防护及未校准 `fp8_e4m3` 单位 Scale 精度坍缩解决方案 |
 | `docs/design/sm70_qwen38_master_summary.md`（**本文档**） | **最终审校三合一总册** | 汇总全部 **42 项优化与修复（`P1`–`P13` + `D1`–`D29`）**，提供相对于 `main`（`be3722bc09`）零冲突、可直接一键应用的 **31 个文件最终合并 Diff** |
 
 ### 1.2 最终全面审校排查并修复的 6 类运行时/编译期隐患汇总（`D27`–`D29`）
