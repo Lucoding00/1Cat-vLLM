@@ -3751,7 +3751,7 @@ index f1afbd5..662e584 100644
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
-index 7826024..d4deb0e 100644
+index 7826024..c6b454e 100644
 --- a/vllm/models/qwen4_exp/nvidia/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/qsa.py
 @@ -5,7 +5,7 @@
@@ -3871,7 +3871,7 @@ index 7826024..d4deb0e 100644
              )
              return output
  
-@@ -373,6 +410,87 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -373,6 +410,137 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          )
          return output
  
@@ -3879,17 +3879,43 @@ index 7826024..d4deb0e 100644
 +        self,
 +        query: torch.Tensor,
 +        group: Any | None = None,
-+    ) -> tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int]:
++    ) -> tuple[
++        Any,
++        torch.Tensor,
++        torch.Tensor | None,
++        int,
++        int,
++        int,
++        int,
++        tuple[int, ...],
++    ]:
++        if query.dim() != 3:
++            raise RuntimeError(
++                f"QSA DCP query all_gather requires 3D prepared query [T, H, D], "
++                f"got shape {tuple(query.shape)} (ensure qsa_prep_sm70_out runs "
++                f"before _start_all_gather_dcp_query)"
++            )
 +        if group is None:
 +            from vllm.distributed import get_dcp_group
 +
 +            group = get_dcp_group()
++        source_ptr = query.data_ptr()
++        source_shape = tuple(query.shape)
 +        q_contig = query if query.is_contiguous() else query.contiguous()
 +        device_group = getattr(group, "device_group", None)
 +        if device_group is None and hasattr(group, "device_communicator"):
 +            device_group = getattr(group.device_communicator, "device_group", None)
 +        if device_group is None:
-+            return (None, group.all_gather(q_contig, dim=1), None, 0, 0, 0)
++            return (
++                None,
++                group.all_gather(q_contig, dim=1),
++                None,
++                0,
++                0,
++                0,
++                source_ptr,
++                source_shape,
++            )
 +        rows, heads, dim = q_contig.shape
 +        world_size = self.dcp_world_size
 +        needed = world_size * rows * heads * dim
@@ -3928,13 +3954,34 @@ index 7826024..d4deb0e 100644
 +        work = torch.distributed.all_gather_into_tensor(
 +            recv_view, q_contig, group=device_group, async_op=True
 +        )
-+        return (work, recv_view, out_buf, rows, heads, dim)
++        return (
++            work,
++            recv_view,
++            out_buf,
++            rows,
++            heads,
++            dim,
++            source_ptr,
++            source_shape,
++        )
 +
 +    def _finish_all_gather_dcp_query(
 +        self,
-+        ag_state: tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int],
++        ag_state: tuple[Any, ...],
++        expected_query: torch.Tensor | None = None,
++        group: Any | None = None,
 +    ) -> torch.Tensor:
-+        work, recv_view, out_buf, rows, heads, dim = ag_state
++        if expected_query is not None and len(ag_state) >= 8:
++            source_ptr = ag_state[6]
++            source_shape = ag_state[7]
++            if (
++                source_ptr != expected_query.data_ptr()
++                or source_shape != tuple(expected_query.shape)
++            ):
++                if ag_state[0] is not None:
++                    ag_state[0].wait()
++                ag_state = self._start_all_gather_dcp_query(expected_query, group)
++        work, recv_view, out_buf, rows, heads, dim = ag_state[:6]
 +        if work is None:
 +            return recv_view
 +        work.wait()
@@ -3950,16 +3997,19 @@ index 7826024..d4deb0e 100644
 +    def _all_gather_dcp_query(
 +        self,
 +        query: torch.Tensor,
-+        group: Any,
++        group: Any | None = None,
++        dcp_ag_state: Any | None = None,
 +    ) -> torch.Tensor:
++        if dcp_ag_state is None:
++            dcp_ag_state = self._start_all_gather_dcp_query(query, group)
 +        return self._finish_all_gather_dcp_query(
-+            self._start_all_gather_dcp_query(query, group)
++            dcp_ag_state, expected_query=query, group=group
 +        )
 +
      def _forward_qsa_dcp(
          self,
          layer: torch.nn.Module,
-@@ -384,8 +502,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -384,8 +552,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          token_to_req: torch.Tensor,
          output: torch.Tensor,
          output_gate: torch.Tensor,
@@ -3973,11 +4023,19 @@ index 7826024..d4deb0e 100644
  
          from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
          from .ops.qsa_dcp import (
-@@ -405,33 +528,89 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -405,33 +578,99 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              )
          ):
              raise RuntimeError("QSA DCP target workspaces are not initialized")
 +        group = get_dcp_group()
++        if dcp_ag_state is not None:
++            if len(dcp_ag_state) < 8 or (
++                dcp_ag_state[6] != query.data_ptr()
++                or dcp_ag_state[7] != tuple(query.shape)
++            ):
++                if dcp_ag_state[0] is not None:
++                    dcp_ag_state[0].wait()
++                dcp_ag_state = None
 +        if dcp_ag_state is None:
 +            dcp_ag_state = self._start_all_gather_dcp_query(query, group)
 +        # Only this prefix of the compacted columns can hold an owned token.
@@ -4036,7 +4094,9 @@ index 7826024..d4deb0e 100644
 -        gathered_query = group.all_gather(query.contiguous(), dim=1)
 -        partial_output = partial_output_buffer[: query.shape[0]]
 -        partial_lse = partial_lse_buffer[: query.shape[0]]
-+        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
++        gathered_query = self._finish_all_gather_dcp_query(
++            dcp_ag_state, expected_query=query, group=group
++        )
 +        partial_output = partial_output_buffer[:rows]
 +        partial_lse = partial_lse_buffer[:rows]
          if partial_output.shape != gathered_query.shape:
@@ -4076,19 +4136,19 @@ index 7826024..d4deb0e 100644
              block_table,
              token_to_req,
              partial_output,
-@@ -439,7 +618,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -439,7 +678,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
              k_scale=layer._k_scale_float,
              v_scale=layer._v_scale_float,
              lse=partial_lse,
 +            pre_resolved_indices=resolve_physical,
 +            dcp_packed_out=send_buffer,
 +            valid_counts=local_valid_counts,
-+        )
+         )
 +        gate_view = (
 +            output_gate
 +            if output_gate.shape == output.shape
 +            else output_gate.reshape(output.shape)
-         )
++        )
 +        if self.dcp_combine is dcp_a2a_lse_reduce:
 +            dcp_a2a_lse_reduce(
 +                partial_output,
@@ -4104,7 +4164,7 @@ index 7826024..d4deb0e 100644
          merged = cast(
              torch.Tensor,
              self.dcp_combine(
-@@ -453,7 +652,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+@@ -453,7 +712,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
          # apply the Triton gate DCP1's page4 route uses. This replaces a chain
          # of five elementwise kernels (12.2 us per decode layer on V100).
          output.copy_(merged)
@@ -4113,7 +4173,7 @@ index 7826024..d4deb0e 100644
  
  
  def _verify_e4m3_kv_requirements(
-@@ -862,6 +1061,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -862,6 +1121,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
          self,
          qkv: torch.Tensor,
          positions: torch.Tensor,
@@ -4122,7 +4182,7 @@ index 7826024..d4deb0e 100644
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
          """Split, normalize, and rotate Q/K using this tree's Qwen3 API."""
          q_gate, key, value = qkv.split(
-@@ -875,7 +1076,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -875,7 +1136,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              key.view(*token_shape, self.num_kv_heads, self.head_dim)
          ).reshape(*token_shape, self.kv_size)
          query, key = self.rotary_emb(positions, query, key)
@@ -4133,7 +4193,7 @@ index 7826024..d4deb0e 100644
  
      def _use_dense_short_context(
          self, num_tokens: int, side_metadata: QSAForwardMetadata
-@@ -956,34 +1159,61 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -956,34 +1219,61 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  value[:num_tokens],
              )
          dense = self._use_dense_short_context(num_tokens, side_metadata)
@@ -4216,7 +4276,7 @@ index 7826024..d4deb0e 100644
                  self.rotary_emb.cos_sin_cache,
                  self.q_norm.weight,
                  self.k_norm.weight,
-@@ -991,7 +1221,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -991,7 +1281,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  prepared,
                  key_cache,
                  value_cache,
@@ -4225,12 +4285,17 @@ index 7826024..d4deb0e 100644
              )
              query = key = value = prepared
          else:
-@@ -1002,6 +1232,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1002,6 +1292,31 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                  self.kv_cache,
                  main_metadata.slot_mapping,
              )
 +        dcp_ag_state = None
-+        if getattr(self, "qsa_dcp_sharded", False) and num_tokens > 0 and not dense:
++        if (
++            getattr(self, "qsa_dcp_sharded", False)
++            and num_tokens > 0
++            and not dense
++            and query.dim() == 3
++        ):
 +            dcp_ag_state = impl._start_all_gather_dcp_query(query[:num_tokens])
 +        selected = self.indexer(
 +            hidden_states,
@@ -4252,7 +4317,7 @@ index 7826024..d4deb0e 100644
          impl.forward_qsa(
              self,
              query,
-@@ -1015,6 +1265,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1015,6 +1330,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              query_positions=side_metadata.logical_positions,
              sequence_lengths=side_metadata.seq_lens,
              dense_short_context=dense,
@@ -4260,7 +4325,7 @@ index 7826024..d4deb0e 100644
          )
          _sm70_dump_qwen_layer_tensor(
              "qsa_core_out",
-@@ -1043,12 +1294,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+@@ -1043,12 +1359,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
              q_gate = qkv[:, : self.q_size * 2].view(
                  num_tokens, self.num_heads, 2 * self.head_dim
              )

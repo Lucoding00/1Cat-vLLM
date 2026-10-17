@@ -414,17 +414,43 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         self,
         query: torch.Tensor,
         group: Any | None = None,
-    ) -> tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int]:
+    ) -> tuple[
+        Any,
+        torch.Tensor,
+        torch.Tensor | None,
+        int,
+        int,
+        int,
+        int,
+        tuple[int, ...],
+    ]:
+        if query.dim() != 3:
+            raise RuntimeError(
+                f"QSA DCP query all_gather requires 3D prepared query [T, H, D], "
+                f"got shape {tuple(query.shape)} (ensure qsa_prep_sm70_out runs "
+                f"before _start_all_gather_dcp_query)"
+            )
         if group is None:
             from vllm.distributed import get_dcp_group
 
             group = get_dcp_group()
+        source_ptr = query.data_ptr()
+        source_shape = tuple(query.shape)
         q_contig = query if query.is_contiguous() else query.contiguous()
         device_group = getattr(group, "device_group", None)
         if device_group is None and hasattr(group, "device_communicator"):
             device_group = getattr(group.device_communicator, "device_group", None)
         if device_group is None:
-            return (None, group.all_gather(q_contig, dim=1), None, 0, 0, 0)
+            return (
+                None,
+                group.all_gather(q_contig, dim=1),
+                None,
+                0,
+                0,
+                0,
+                source_ptr,
+                source_shape,
+            )
         rows, heads, dim = q_contig.shape
         world_size = self.dcp_world_size
         needed = world_size * rows * heads * dim
@@ -463,13 +489,34 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         work = torch.distributed.all_gather_into_tensor(
             recv_view, q_contig, group=device_group, async_op=True
         )
-        return (work, recv_view, out_buf, rows, heads, dim)
+        return (
+            work,
+            recv_view,
+            out_buf,
+            rows,
+            heads,
+            dim,
+            source_ptr,
+            source_shape,
+        )
 
     def _finish_all_gather_dcp_query(
         self,
-        ag_state: tuple[Any, torch.Tensor, torch.Tensor | None, int, int, int],
+        ag_state: tuple[Any, ...],
+        expected_query: torch.Tensor | None = None,
+        group: Any | None = None,
     ) -> torch.Tensor:
-        work, recv_view, out_buf, rows, heads, dim = ag_state
+        if expected_query is not None and len(ag_state) >= 8:
+            source_ptr = ag_state[6]
+            source_shape = ag_state[7]
+            if (
+                source_ptr != expected_query.data_ptr()
+                or source_shape != tuple(expected_query.shape)
+            ):
+                if ag_state[0] is not None:
+                    ag_state[0].wait()
+                ag_state = self._start_all_gather_dcp_query(expected_query, group)
+        work, recv_view, out_buf, rows, heads, dim = ag_state[:6]
         if work is None:
             return recv_view
         work.wait()
@@ -485,10 +532,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     def _all_gather_dcp_query(
         self,
         query: torch.Tensor,
-        group: Any,
+        group: Any | None = None,
+        dcp_ag_state: Any | None = None,
     ) -> torch.Tensor:
+        if dcp_ag_state is None:
+            dcp_ag_state = self._start_all_gather_dcp_query(query, group)
         return self._finish_all_gather_dcp_query(
-            self._start_all_gather_dcp_query(query, group)
+            dcp_ag_state, expected_query=query, group=group
         )
 
     def _forward_qsa_dcp(
@@ -529,6 +579,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         ):
             raise RuntimeError("QSA DCP target workspaces are not initialized")
         group = get_dcp_group()
+        if dcp_ag_state is not None:
+            if len(dcp_ag_state) < 8 or (
+                dcp_ag_state[6] != query.data_ptr()
+                or dcp_ag_state[7] != tuple(query.shape)
+            ):
+                if dcp_ag_state[0] is not None:
+                    dcp_ag_state[0].wait()
+                dcp_ag_state = None
         if dcp_ag_state is None:
             dcp_ag_state = self._start_all_gather_dcp_query(query, group)
         # Only this prefix of the compacted columns can hold an owned token.
@@ -582,7 +640,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             num_cache_blocks=key_cache.shape[0] if resolve_physical else None,
             valid_counts=local_valid_counts,
         )
-        gathered_query = self._finish_all_gather_dcp_query(dcp_ag_state)
+        gathered_query = self._finish_all_gather_dcp_query(
+            dcp_ag_state, expected_query=query, group=group
+        )
         partial_output = partial_output_buffer[:rows]
         partial_lse = partial_lse_buffer[:rows]
         if partial_output.shape != gathered_query.shape:
@@ -1233,7 +1293,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 main_metadata.slot_mapping,
             )
         dcp_ag_state = None
-        if getattr(self, "qsa_dcp_sharded", False) and num_tokens > 0 and not dense:
+        if (
+            getattr(self, "qsa_dcp_sharded", False)
+            and num_tokens > 0
+            and not dense
+            and query.dim() == 3
+        ):
             dcp_ag_state = impl._start_all_gather_dcp_query(query[:num_tokens])
         selected = self.indexer(
             hidden_states,
