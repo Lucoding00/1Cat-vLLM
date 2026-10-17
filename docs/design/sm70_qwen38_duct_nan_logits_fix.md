@@ -1,13 +1,129 @@
-# `Qwen3.8-Flash-Next` SM70/V100 推理输出坍缩 `"duct"` + `logits NaN` + `MTP 0% 接受率` 根因定性与代码修复手册
+# `Qwen3.8-Flash-Next` SM70/V100 推理输出坍缩 `"duct"` + `logits NaN` + `MTP 0% 接受率` 根因定性与代码修复手册（含最终 GPU 实证结论）
 
-> **针对环境**：`/home/ma-user/work/1cat-vllm-latest`（`4 × V100`，`TP4 + DCP2 + MTP4`，`Qwen3.8-Flash-Next-NVFP4`）  
-> **核心结论**：您提供的定位证据链中的 **【候选 1：D14 异步 DCP Query AllGather 与 `qsa_prep_sm70_out` 数据流错配 + `_all_gather_dcp_query` 返回值错误】100% 命中真实根因**。该单个 Bug 同时解释了 **短/长上下文均 `NaN`**、**`logprobs` 返回 400 `nan`**、**生成内容恒为 `"duct" × 80`** 以及 **MTP 草稿 `172/172` 全部被拒（接受率 `0.0%`）** 的全部四个现象。
+> **针对环境**：`/home/ma-user/work/1cat-vllm-latest`（`4 × V100`，`TP4 + DCP2 (+ MTP4)`，`Qwen3.8-Flash-Next-NVFP4`）  
+> **最终实证根因（已通过 GPU 独立脚本与线上 Eager 推理 100% 闭环验证）**：
+> 1. **主根因（`sm70_fp16_gemv.py` GDN 投影 Split Kernel 启动网格错配）**：在 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` 中，`_split_gdn_projection_tails` 与 `_split_gdn_projection_outputs` 的 Triton 启动网格被设为 `(m, triton.cdiv(1536, 256))`（仅 6 个 CTA，覆盖 `col ∈ [0, 1536)`），而 `_qwen38_gdn_projection_split_kernel` 内核写回 `z` 的掩码为 `(col >= QKV) & (col < QKV + Z)`（`QKV = 2560, Z = 1536`）。当 `col < 1536` 时 `col >= 2560` **恒为 `False`**，导致 `z = mixed_qkvz.new_empty((num_tokens, 12, 128))` **100% 永远不被写入**，直接将未初始化显存垃圾（含稀疏 FP16 `NaN`/`Inf`）送入 `RMSNormGated(core_attn_out, z)` 与 `out_proj`，从首个出现脏显存复用的 GDN 层扩散至全模型。将该文件两处 `triton.cdiv(1536, 256)` 恢复为 **`triton.cdiv(4096, 256)`（16 块）** 后，`NaN` 完全归零，推理输出恢复正常。
+> 2. **次级防御加固（`qsa.py` 异步 DCP Query AllGather 顺序与 3D 形状校验）**：当开启 `sm70_qsa_prep` 时，确保 `_run_qsa` 先完成 `qsa_prep_sm70_out`（生成归一化 3D `prepared` Query）再发起 `_start_all_gather_dcp_query`，并在 `_finish_all_gather_dcp_query` 中保证 `rows > 1` 的跨卡维度转置。
 
 ---
 
-## 1. 为什么现在代码无法正常推理？（完整因果链复盘）
+## 0. 最终版根因复盘：`sm70_fp16_gemv.py` GDN 投影 Split Kernel 网格错配（为什么正是这个原因？）
 
-### 1.1 第一现场：`vllm/models/qwen4_exp/nvidia/qsa.py` 中 `_run_qsa`（服务器行号 `1162–1233`）与 `_forward_qsa_dcp`（服务器行号 `523–657`）的三重错配
+### 0.1 为什么这个根因完美解释了三轮实验的全部现象？
+
+1. **为什么 `z` 缓冲区 100% 未被写入，且呈现“稀疏 `NaN`（`96 / 36864 ≈ 0.26%`）”？**
+   - 在 `qwen_gdn_linear_attn.py`（`L3090–3115` 与 `L5866–5879`）中，因 `D16` 将 `_split_gdn_projection_tails` 的触发条件从 `mixed_qkvz.shape[0] in (5, 20)` 放宽到了 **`mixed_qkvz.shape[0] > 1`**，所有 `m > 1` 的 Prefill（如 24 tokens）都会进入：
+     ```python
+     z = mixed_qkvz.new_empty((num_tokens, 12, 128))
+     mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z)
+     ```
+   - 在 `sm70_fp16_gemv.py` 中，`_qwen38_gdn_projection_split_kernel` 的列索引与 `z` 写回逻辑为：
+     ```python
+     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+     value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
+     if COPY_QKV:
+         tl.store(qkv + row * QKV + col, value, col < QKV)
+     tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
+     ```
+     其中 `QKV = 2560`、`Z = 1536`、`BLOCK = 256`。只有 **`program_id(1) ∈ [10, 15]`**（对应 `col ∈ [2560, 4096)`）的 6 个 CTA 才会满足 `(col >= 2560) & (col < 4096)` 并向 `z` 写入数据。
+   - 当服务器上 `_split_gdn_projection_tails`（及 `_split_gdn_projection_outputs`）的启动 grid 被写成 `(m, triton.cdiv(1536, 256)) = (m, 6)`（可能由全局替换 `s/triton.cdiv(4096, 256)/triton.cdiv(1536, 256)/g` 或未同步内核分支导致）时：
+     - 只启动了 `program_id(1) ∈ [0, 5]`，即 `col ∈ [0, 1536)`；
+     - `col >= 2560` 对所有线程**恒为 `False`**，`tl.store(z + ...)` 被 100% 掩码屏蔽，**没有任何一个线程向 `z` 写入过哪怕 1 个字节**！
+     - 因此 `z` 完全保留了 `torch.new_empty((24, 12, 128))` 从 PyTorch CUDA Caching Allocator 分配出来的**未初始化显存旧数据**（在 IEEE-754 FP16 中，指数位为 `0b11111` 的随机旧显存位模式恰好表现为 `~0.26%–0.7%` 的稀疏 `NaN`/`Inf`）。
+
+2. **为什么“短 Prompt（1 token 即结束）偶发正常”，而正常多 Token Prompt 必现 `NaN`？**
+   - 因为 `_can_fuse_gdn_projection_split`（`sm70_fp16_gemv.py:150`）和 `qwen_gdn_linear_attn.py:3108` 都显式要求 **`qkvz.shape[0] > 1`**！
+   - 当 Prompt 只有 `1` 个 token（`m == 1`）时，不走 `_split_gdn_projection_tails`，而是走 `mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)` 视图切片，所以 `m == 1` 时 `z` 是正确的！
+   - 一旦 Prompt 长度 `m > 1`（如 17、24、2500 tokens），Prefill 必定走 `_split_gdn_projection_tails`，`z` 立即变成未初始化显存垃圾。
+
+3. **为什么在 Eager 模式下首现点是 `layers.2.linear_attn`，而在第二轮（`torch.compile` 编译模式）下 `gdn_out=0` 且只看到 `ops/hc.py`、`moe_in_x`、`qsa_in_hidden` 报 `NaN`？**
+   - **为什么第二轮编译模式看不到 `gdn_out` 和 `layer{i}_after_attn`**：
+     `nan_diag.py` 中写有 `if not _ENABLED or torch.compiler.is_compiling(): return`。在开启 `torch.compile` 时，`Qwen4ExpModel.forward`、`Qwen4ExpDecoderLayer.forward`、`QwenGatedDeltaNetAttention.forward`、`RMSNormGated` 均在 Dynamo 追踪期（`is_compiling() == True`）被内联编译，其中的 `nan_diag.check()` 在追踪期直接 `return` 被短路，根本没有进入编译后的 FX 图！运行时只有通过 `direct_register_custom_op` 注册的图外不透明算子（`ops/hc.py` 的 `_hc_combine_norm_impl` / `_hc_gate_mix`、`nvfp4_sm70_moe.py`、`qsa.py:_run_qsa`、`indexer_qsa.py`）以 `is_compiling() == False` 执行 Python 回调，因此第二轮只能看到下游扩散后的 `NaN`。
+   - **为什么第三轮切换 `--compilation-config '{"mode":"NONE"}'`（Eager 模式）后一击锁定 `layers.2.linear_attn`**：
+     Eager 模式下 `is_compiling()` 恒为 `False`，全模型探针全部生效。在 `layers.0` 和 `layers.1` 中，虽然 `z` 同样未被写入，但模型刚启动时 `new_empty` 拿到的是刚清零的显存页（全 `0` 有限值，虽不产生 `NaN` 但已破坏数值）；到了 **`layers.2.linear_attn`**，`new_empty((24, 12, 128))` 复用了前两层释放的脏显存块，其中恰好含有 `96` 个 `NaN` 和 `1` 个 `Inf`（`96 / 36864 ≈ 0.26%`），经 `RMSNormGated(core_attn_out, z)` 与 `out_proj`（`[24, 1536] @ [1536, 2560]` 稠密矩阵乘 + TP4 AllReduce）后，将含 `NaN` 的行放大为整行 `2560` 维全 `NaN`，并从 `layers.3` 起污染后续全部层的 `hidden_states`、KV Cache 与 Mamba 状态。
+
+### 0.2 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` 修复代码
+
+确保 `_qwen38_gdn_projection_split_kernel`、`_split_gdn_projection_outputs` 与 `_split_gdn_projection_tails` 统一使用覆盖完整 `QKV + Z = 4096` 列的 **`(m, triton.cdiv(4096, 256))`（16 块）** 网格：
+
+```python
+@triton.jit
+def _qwen38_gdn_projection_split_kernel(
+    qkvz,
+    ba,
+    qkv,
+    z,
+    b,
+    a,
+    QKV: tl.constexpr,
+    Z: tl.constexpr,
+    B: tl.constexpr,
+    A: tl.constexpr,
+    BLOCK: tl.constexpr,
+    COPY_QKV: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
+    if COPY_QKV:
+        tl.store(qkv + row * QKV + col, value, col < QKV)
+    tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
+    if tl.program_id(1) == 0:
+        tl.static_assert(B + A <= BLOCK)
+        gate_col = tl.arange(0, BLOCK)
+        gate = tl.load(ba + row * (B + A) + gate_col, gate_col < B + A, other=0)
+        tl.store(b + row * B + gate_col, gate, gate_col < B)
+        tl.store(a + row * A + gate_col - B, gate, (gate_col >= B) & (gate_col < B + A))
+
+
+def _split_gdn_projection_outputs(qkvz, ba):
+    m = qkvz.shape[0]
+    out = tuple(qkvz.new_empty((m, n)) for n in (2560, 1536, 12, 12))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+        qkvz,
+        ba,
+        *out,
+        QKV=2560,
+        Z=1536,
+        B=12,
+        A=12,
+        BLOCK=256,
+        COPY_QKV=True,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+def _split_gdn_projection_tails(qkvz, ba, z_out):
+    """Copy z/b/a together while preserving the input QKV view and stride."""
+    m = qkvz.shape[0]
+    qkv = qkvz[:, :2560]
+    b, a = (qkvz.new_empty((m, 12)) for _ in range(2))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+        qkvz,
+        ba,
+        qkv,
+        z_out,
+        b,
+        a,
+        QKV=2560,
+        Z=1536,
+        B=12,
+        A=12,
+        BLOCK=256,
+        COPY_QKV=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    return qkv, b, a
+```
+
+---
+
+## 1. 次级加固：`vllm/models/qwen4_exp/nvidia/qsa.py` 异步 DCP Query AllGather 顺序与 3D 形状保护
+
+### 1.1 背景说明：`vllm/models/qwen4_exp/nvidia/qsa.py` 中 `_run_qsa` 与 `_forward_qsa_dcp` 的防御校验
 
 在服务器 `/home/ma-user/work/1cat-vllm-latest/vllm/models/qwen4_exp/nvidia/qsa.py` 中，当合入 `D14`（异步 DCP Query AllGather 与 Indexer 重叠）时，出现了以下 **3 处致命错配**：
 

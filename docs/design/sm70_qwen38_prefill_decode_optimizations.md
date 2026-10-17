@@ -2589,39 +2589,32 @@ index 7826024..ca57e58 100644
 
 ### 8.17 `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py`
 
+> **注**：保留 `_split_gdn_projection_outputs` 与 `_split_gdn_projection_tails` 的统一 16 块网格 `(m, triton.cdiv(4096, 256))`，避免仅替换 launch grid 为 `triton.cdiv(1536, 256)` 时 `col < 1536` 与 `col >= QKV (2560)` 掩码互斥导致 `z` 缓冲区完全未被写入（残留未初始化显存 `NaN`/`Inf`）。
+
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py b/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
-index 14b4750..ecedc69 100644
+index 14b4750..e7159f3 100644
 --- a/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
 +++ b/vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py
-@@ -83,11 +83,15 @@ def _qwen38_gdn_projection_split_kernel(
-     COPY_QKV: tl.constexpr,
- ):
-     row = tl.program_id(0)
--    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
--    value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
-     if COPY_QKV:
-+        col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-+        value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
-         tl.store(qkv + row * QKV + col, value, col < QKV)
--    tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
-+        tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
-+    else:
-+        z_col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-+        value = tl.load(qkvz + row * (QKV + Z) + QKV + z_col, z_col < Z, other=0)
-+        tl.store(z + row * Z + z_col, value, z_col < Z)
-     if tl.program_id(1) == 0:
-         tl.static_assert(B + A <= BLOCK)
-         gate_col = tl.arange(0, BLOCK)
-@@ -120,7 +124,7 @@ def _split_gdn_projection_tails(qkvz, ba, z_out):
-     m = qkvz.shape[0]
-     qkv = qkvz[:, :2560]
-     b, a = (qkvz.new_empty((m, 12)) for _ in range(2))
--    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
-+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(1536, 256))](
-         qkvz,
-         ba,
-         qkv,
+@@ -47,6 +47,7 @@ _QSA_OUT_SUFFIX = ".self_attn.o_proj"
+ _QSA_INDEX_SUFFIX = ".self_attn.indexer.index_qk_proj"
+ _ROUTER_SUFFIX = ".mlp.gate"
+ _SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
++_SHARED_DOWN_SUFFIX = ".mlp.shared_expert.down_proj"
+ 
+ # Plans are cold-cache CUDA Graph winners on real checkpoint weights. Keep the
+ # role in the key: GDN and QSA can share a physical shape while remaining
+@@ -714,6 +715,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
+ 
+ 
+ def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
++    if prefix.endswith(_QSA_INDEX_SUFFIX) and shape == (128, 2560):
++        return _GemvPlan(512, 2, 0)
++    if prefix.endswith(_SHARED_DOWN_SUFFIX) and shape == (2560, 160):
++        return _GemvPlan(256, 2, 0)
+     for suffix, expected_shape, plan in _ROLE_PLANS:
+         if prefix.endswith(suffix) and shape == expected_shape:
+             return plan
 ```
 
 ### 8.18 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py`
