@@ -745,23 +745,63 @@ exec vllm serve "${MODEL_PATH}" \
 
 ---
 
-## 5. 开启 `--kv-cache-dtype fp8_e4m3` 的启动配置说明
+## 5. 开启 `--kv-cache-dtype fp8_e4m3` 的启动配置说明与 `"duct"` 乱码根因排查
 
-如果您希望将 QSA 主 KV Cache 从 FP16（`auto`）切换为 **`fp8_e4m3`**（使 12 层主模型 QSA KV 显存占用与访存带宽再降 50%），可以根据模型权重是否包含 `mtp.layers.0.self_attn.{k,v}_scale` 选择以下两种写法：
+> **重要提示（针对 `RadixArk/Qwen3.8-Flash-Next-NVFP4` 原始权重）**：
+> `RadixArk/Qwen3.8-Flash-Next-NVFP4` 原始权重的 `hf_quant_config.json` 将 `*.self_attn.*` 列在 `exclude_modules` 中，**不包含任何 KV Cache 校准缩放因子（`k_scale` / `v_scale`）**。
+> - 如果在未挂载 `model-kvscales.safetensors` 离线校准包的情况下直接传 `--kv-cache-dtype fp8_e4m3`，启动日志会出现：
+>   ```text
+>   WARNING: No KV-cache quantization metadata found in hf_quant_config.json...
+>   WARNING: QSA E4M3 scale overlay is incomplete: 0/24 local K/V scales loaded. Falling back to unit scales for missing tensors: ...
+>   ```
+> - 本仓库的 QSA E4M3 量化公式为 `q = round_to_e4m3(x / scale)`，其中正常校准后的 `scale = max_abs / 448.0 ≈ 0.009 ~ 0.034`（因为 RoPE/K-norm 后的 K/V 幅值通常在 `4 ~ 15`，而 FP8 E4M3 的最大可表示值为 `448.0`）。一旦回退到单位缩放因子 `scale = 1.0`（仓库 `tools/qwen4_exp/README.md` 明确将其标记为 `--unit-scale-negative-control` 负向对照），原本应利用 `[-448, 448]` 全动态范围的 K/V 被压缩在 `[-15, 15]` 的粗糙指数桶中，尾数精度损失高达 **30~100 倍**，12 层 QSA 注意力累积误差会导致模型输出全部坍缩为重复的 **`"duct"`** 乱码 Token！
+> - **因此，对于未做离线 KV 校准的 `RadixArk/Qwen3.8-Flash-Next-NVFP4`，请务必使用上文第 4 节脚本中的 `--kv-cache-dtype auto`（原生 FP16 KV Cache）！** 在 `TP4 + DCP2` 下，由于仅有 12/48 层为 QSA 且 Indexer Cache（`3.75 KB/token/GPU`）恒为 FP16，将主 QSA KV 从 `fp8_e4m3`（总计 `6.75 KB/token/GPU`，容量 `377,795 tokens`）切换为 `auto`（`float16`，总计 `9.75 KB/token/GPU`）后，在 `--gpu-memory-utilization 0.90` 下仍可提供 **`~261,550 tokens`**（若设为 `0.91~0.92` 则 **`>262,144 tokens`**）的完整 256K 上下文，且还能额外激活 `_sm70_qsa_prep`（`qsa_prep_sm70_out` 融合算子 + `D14` 异步 DCP Query AllGather 重叠）快速路径！
 
-1. **写法 A（权重自带完整 26 个校准 scale，即主模型 12 层 + MTP 1 层）**：
-   直接将 `--kv-cache-dtype auto` 改为 `--kv-cache-dtype fp8_e4m3`：
+如果您希望将 QSA 主 KV Cache 从 FP16（`auto`）切换为 **`fp8_e4m3`**（使 12 层主模型 QSA KV 显存占用与访存带宽再降 50%，KV 容量提升至 `377,795 tokens`），**必须先为模型权重挂载离线校准的 `model-kvscales.safetensors`**（见下方 **5.2 节**），随后根据校准包是否包含 `mtp.layers.0.self_attn.{k,v}_scale` 选择以下两种写法：
+
+1. **写法 A（权重已挂载完整 26 个校准 scale，即主模型 12 层 = 24 个 + MTP 1 层 = 2 个）**：
+   直接将 `--kv-cache-dtype auto` 改为 `--kv-cache-dtype fp8_e4m3`，并开启严格 scale 校验防止意外退化为单位 scale：
    ```bash
+   export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1
+   # 启动参数：
    --kv-cache-dtype fp8_e4m3 \
    --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
    ```
 
-2. **写法 B（通用稳妥写法：主模型 12 层用 `fp8_e4m3`，MTP 1 层保持 `float16`）**：
-   如果权重中没有 `mtp.layers.0.self_attn.{k,v}_scale`（直接开 `fp8_e4m3` 会报 `QSA E4M3 speculative draft scale overlay is incomplete: loaded 0/2 scale tensors.`），可以在 `--speculative-config` 中单独指定 Draft KV 为 `"float16"`：
+2. **写法 B（权重已挂载主模型 12 层 = 24 个校准 scale，MTP 1 层保持 `float16`）**：
+   如果校准包中仅有主模型 24 个 scale 而没有 `mtp.layers.0.self_attn.{k,v}_scale`（直接开 `fp8_e4m3` 会报 `QSA E4M3 speculative draft scale overlay is incomplete: loaded 0/2 scale tensors.`），可以在 `--speculative-config` 中单独指定 Draft KV 为 `"float16"`：
    ```bash
+   export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1
+   # 启动参数：
    --kv-cache-dtype fp8_e4m3 \
    --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'
    ```
+
+> **提示**：切换 `--kv-cache-dtype`（例如从 `fp8_e4m3` 切回 `auto`）前，建议清理一次 `/tmp/vllm-compile-cache-dp*` 缓存目录（`rm -rf /tmp/vllm-compile-cache-dp*`），确保不会复用旧 KV 类型的编译缓存。
+
+### 5.2 如何为 `RadixArk/Qwen3.8-Flash-Next-NVFP4` 生成并合入 `fp8_e4m3` 校准包
+
+本仓库在 `tools/qwen4_exp/` 下内置了专用的离线校准与 scale 合成工具（且注意 `Qwen4ExpQSAFlashAttentionBackend` 不支持 `fp8_e5m2`，也禁止在线 `--calculate-kv-scales`）：
+
+1. **情况一：若机器上已有校准清单文件**（例如测试代码中引用的 `/home/l/models/qwen38-flash-next-e4m3-kvscales/kvscales-manifest.json`）：
+   直接运行 `materialize_qsa_scale_overlay.py` 生成 `model-kvscales.safetensors` 并合并进模型目录的 `model.safetensors.index.json`：
+   ```bash
+   python3 tools/qwen4_exp/materialize_qsa_scale_overlay.py \
+     --manifest /home/l/models/qwen38-flash-next-e4m3-kvscales/kvscales-manifest.json \
+     --base-index "${MODEL_PATH}/model.safetensors.index.json" \
+     --output-dir "${MODEL_PATH}"
+   ```
+2. **情况二：从零运行离线校准生成 `model-kvscales.safetensors`**：
+   使用 `tools/qwen4_exp/qsa_kv_calibration.py` 在 4 张 V100 上跑少量校准样本生成 24 个（或含 MTP 共 26 个）`k_scale`/`v_scale` 并写入 `model-kvscales.safetensors`：
+   ```bash
+   python3 tools/qwen4_exp/qsa_kv_calibration.py \
+     --model "${MODEL_PATH}" \
+     --dataset /path/to/calibration_texts.jsonl \
+     --output-dir "${MODEL_PATH}" \
+     --tp-size 4 \
+     --include-mtp
+   ```
+   合入后，启动日志将不再出现 `0/24 local K/V scales loaded`，`fp8_e4m3` 输出即可恢复正常精度。
 
 ### 5.1 为什么在 `main` 分支上传了 `"kv_cache_dtype":"float16"` 仍会报 `Loaded 0/2`？（根因与修复 `D27`）
 

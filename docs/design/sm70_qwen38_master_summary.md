@@ -112,150 +112,130 @@
 
 ## 4. 生产级最佳启动脚本汇总（256K + 多模态 + 工具调用 + MTP4 + `fp8_e4m3`）
 
-### 4.1 `4 × V100 32GB` 启动脚本（`TP4 + DCP2 + MTP4 + fp8_e4m3`）
+### 4.1 `4 × V100 32GB` 推荐生产启动脚本（`TP4 + DCP2 + MTP4 + 256K + 多模态 + 工具调用`）
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next}"
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next-NVFP4}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# SM70 QSA Prefill & Decode 核心加速开关
-export VLLM_SM70_QSA_INDEXER_CUBLAS=1
-export VLLM_SM70_QSA_CUBLAS_MIN_ROWS=64
-export VLLM_SM70_QSA_SCORE_TILE_MB=32
-export VLLM_SM70_QSA_GROUPED_PAGE4=1
-export VLLM_SM70_QSA_GROUPED_PAD_FIX=1
-export VLLM_SM70_QSA_MTP_TOPK=1
+# 关闭默认 Disk-Mmap PLE，使用 Pinned-Host UVA（4 Worker × 12 GiB = 48 GiB Host RAM）
+export VLLM_PLE_CPU_OFFLOAD=0
+export VLLM_PLE_DISK_OFFLOAD=0
+export VLLM_SM70_QWEN38_HYBRID_PLE=0
+export VLLM_QWEN4EXP_PLE_HOST_GIB="${VLLM_QWEN4EXP_PLE_HOST_GIB:-12}"
 
-# SM70 PLE Speculative Short-Conv & TurboMind NVFP4 MoE 核心加速开关
-export VLLM_SM70_PLE_SPEC_CONV=1
-export VLLM_SM70_TURBOMIND_MOE_COMPACT_SHARED=1
-export VLLM_SM70_TURBOMIND_MOE_FUSED_PREP=1
-export VLLM_SM70_TURBOMIND_MOE_SMALL_UNROUTE=1
-
-vllm serve "${MODEL_PATH}" \
+exec vllm serve "${MODEL_PATH}" \
+  --served-model-name Qwen3.8-Flash-Next \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
-  --dtype float16 \
-  --kv-cache-dtype fp8_e4m3 \
   --tensor-parallel-size 4 \
   --decode-context-parallel-size 2 \
-  --dcp-comm-backend a2a \
-  --cp-kv-cache-interleave-size 64 \
-  --block-size 800 \
+  --dtype half \
+  --kv-cache-dtype auto \
   --max-model-len 262144 \
-  --max-num-seqs 8 \
-  --max-num-batched-tokens 16384 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 4 \
   --gpu-memory-utilization 0.90 \
+  --no-async-scheduling \
+  --mamba-cache-mode align \
   --enable-prefix-caching \
-  --enable-chunked-prefill \
-  --async-scheduling \
-  --limit-mm-per-prompt '{"image":5,"video":2}' \
-  --mm-encoder-tp-mode data \
+  --no-language-model-only \
+  --limit-mm-per-prompt '{"image":4,"video":0}' \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}' \
-  --kernel-config '{
-    "sm70_hcx": true,
-    "sm70_hcx_moe_allreduce": true,
-    "sm70_hcx_output_projection": true,
-    "sm70_fp16_gemv": true,
-    "sm70_fp16_fused_hc": true,
-    "sm70_mtp_fc_combine": true,
-    "sm70_qsa_prep": true,
-    "sm70_qsa_side_fusion": true,
-    "sm70_qsa_shared_key": true,
-    "qsa_dense_short_context": true
-  }' \
-  --compilation-config '{
-    "mode": 3,
-    "cudagraph_mode": "FULL_AND_PIECEWISE",
-    "cudagraph_capture_sizes": [1, 2, 4, 8]
-  }'
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
+  --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --seed 0
 ```
 
-### 4.2 `8 × V100 32GB` 单入口 `DP2 × TP4 + DCP2 + MTP4 + fp8_e4m3` 启动脚本
+### 4.2 `8 × V100 32GB` 单入口 `DP2 × TP4 + DCP2 + MTP4 + 256K` 推荐生产启动脚本
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next}"
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3.8-Flash-Next-NVFP4}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
+# 8 张 V100 全部可见：DP0 使用 GPU 0..3，DP1 使用 GPU 4..7
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# SM70 QSA Prefill & Decode 核心加速开关
-export VLLM_SM70_QSA_INDEXER_CUBLAS=1
-export VLLM_SM70_QSA_CUBLAS_MIN_ROWS=64
-export VLLM_SM70_QSA_SCORE_TILE_MB=32
-export VLLM_SM70_QSA_GROUPED_PAGE4=1
-export VLLM_SM70_QSA_GROUPED_PAD_FIX=1
-export VLLM_SM70_QSA_MTP_TOPK=1
+# 关闭默认 Disk-Mmap PLE，使用 Pinned-Host UVA（8 Worker × 10 GiB = 80 GiB Host RAM）
+# 若主机空闲内存较小（64~96 GiB），可改为 VLLM_SM70_QWEN38_HYBRID_PLE=1 VLLM_PLE_CPU_OFFLOAD=1 VLLM_QWEN4EXP_PLE_HOST_GIB=4
+export VLLM_PLE_CPU_OFFLOAD=0
+export VLLM_PLE_DISK_OFFLOAD=0
+export VLLM_SM70_QWEN38_HYBRID_PLE=0
+export VLLM_QWEN4EXP_PLE_HOST_GIB="${VLLM_QWEN4EXP_PLE_HOST_GIB:-10}"
 
-# SM70 PLE Speculative Short-Conv & TurboMind NVFP4 MoE 核心加速开关
-export VLLM_SM70_PLE_SPEC_CONV=1
-export VLLM_SM70_TURBOMIND_MOE_COMPACT_SHARED=1
-export VLLM_SM70_TURBOMIND_MOE_FUSED_PREP=1
-export VLLM_SM70_TURBOMIND_MOE_SMALL_UNROUTE=1
+# 如曾以不同 --kv-cache-dtype 启动过，清理旧编译缓存避免跨 KV dtype 复用
+rm -rf /tmp/vllm-compile-cache-dp*
 
-vllm serve "${MODEL_PATH}" \
+exec vllm serve "${MODEL_PATH}" \
+  --served-model-name Qwen3.8-Flash-Next \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
-  --dtype float16 \
-  --kv-cache-dtype fp8_e4m3 \
   --data-parallel-size 2 \
   --tensor-parallel-size 4 \
   --decode-context-parallel-size 2 \
-  --dcp-comm-backend a2a \
-  --cp-kv-cache-interleave-size 64 \
-  --block-size 800 \
+  --dtype half \
+  --kv-cache-dtype auto \
   --max-model-len 262144 \
-  --max-num-seqs 16 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.92 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 4 \
+  --gpu-memory-utilization 0.90 \
+  --no-async-scheduling \
+  --mamba-cache-mode align \
   --enable-prefix-caching \
-  --enable-chunked-prefill \
-  --async-scheduling \
-  --limit-mm-per-prompt '{"image":5,"video":2}' \
-  --mm-encoder-tp-mode data \
+  --no-language-model-only \
+  --limit-mm-per-prompt '{"image":4,"video":0}' \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}' \
-  --kernel-config '{
-    "sm70_hcx": true,
-    "sm70_hcx_moe_allreduce": true,
-    "sm70_hcx_output_projection": true,
-    "sm70_fp16_gemv": true,
-    "sm70_fp16_fused_hc": true,
-    "sm70_mtp_fc_combine": true,
-    "sm70_qsa_prep": true,
-    "sm70_qsa_side_fusion": true,
-    "sm70_qsa_shared_key": true,
-    "qsa_dense_short_context": true
-  }' \
-  --compilation-config '{
-    "mode": 3,
-    "cudagraph_mode": "FULL_AND_PIECEWISE",
-    "cudagraph_capture_sizes": [1, 2, 4, 8, 16]
-  }'
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
+  --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --seed 0
 ```
+
+### 4.3 为什么未校准的 `RadixArk/Qwen3.8-Flash-Next-NVFP4` 直接开启 `--kv-cache-dtype fp8_e4m3` 会输出重复 `"duct"` 乱码？
+
+1. **根因链路**：
+   - `RadixArk/Qwen3.8-Flash-Next-NVFP4` 的 `hf_quant_config.json` 将 `*.self_attn.*` 列在 `exclude_modules` 中，**不包含任何 QSA KV Cache 缩放因子（`k_scale` / `v_scale`）**。
+   - 当未挂载 `model-kvscales.safetensors` 离线校准包而直接传 `--kv-cache-dtype fp8_e4m3` 时，`vllm/models/qwen4_exp/nvidia/model.py:189` 会打印告警：
+     ```text
+     WARNING: QSA E4M3 scale overlay is incomplete: 0/24 local K/V scales loaded. Falling back to unit scales for missing tensors: ...
+     ```
+     并调用 `module.adopt_default_kv_scales()` 将全部 12 层 QSA 的 `_k_scale_float` / `_v_scale_float` 设为单位值 **`1.0`**。
+   - 本仓库 QSA E4M3 的量化契约为 `q = round_to_e4m3(x / scale)`，正常校准后的 `scale = max_abs / 448.0 ≈ 0.009 ~ 0.034`（将幅值在 `4 ~ 15` 的 K/V 拉伸映射至 FP8 E4M3 的 `[-448, 448]` 全动态范围）。当回退到单位 `scale = 1.0`（`tools/qwen4_exp/README.md` 明确将其定义为 `--unit-scale-negative-control` 负向对照）时，FP8 E4M3 损失了 **30~100 倍** 的有效动态范围，12 层 QSA 注意力输出严重失真，最终导致模型解码坍缩为重复输出 `"duct"` 乱码 Token。
+
+2. **解决方案对比**：
+   - **方案 A（推荐开箱即用）：使用 `--kv-cache-dtype auto`（原生 FP16 KV Cache）**
+     - 零校准依赖、原生 FP16 精度无损。
+     - 在 `TP4 + DCP2` 下，由于仅 12/48 层为 QSA 且 Indexer Cache（`3.75 KB/token/GPU`）恒为 FP16，将主 QSA KV 从 `fp8_e4m3`（总计 `6.75 KB/token/GPU` -> `377,795 tokens`）切回 `auto`（`float16`，总计 `9.75 KB/token/GPU`）后，在 `--gpu-memory-utilization 0.90` 下仍拥有 **`~261,550 tokens`**（设为 `0.91~0.92` 则 **`>262,144 tokens`**），完全满足 256K 上下文需求。
+     - 同时，`--kv-cache-dtype auto` 还会自动激活 `_sm70_qsa_prep`（`qsa_prep_sm70_out` 融合算子 + `D14` 异步 DCP Query AllGather 重叠）快速路径。
+   - **方案 B（需要 377K+ KV 容量时）：先生成/合入 `model-kvscales.safetensors` 离线校准包，再开启 `fp8_e4m3`**
+     - 若机器上已有校准清单（如 `/home/l/models/qwen38-flash-next-e4m3-kvscales/kvscales-manifest.json`），直接合入模型目录：
+       ```bash
+       python3 tools/qwen4_exp/materialize_qsa_scale_overlay.py \
+         --manifest /home/l/models/qwen38-flash-next-e4m3-kvscales/kvscales-manifest.json \
+         --base-index "${MODEL_PATH}/model.safetensors.index.json" \
+         --output-dir "${MODEL_PATH}"
+       ```
+     - 或使用 `tools/qwen4_exp/qsa_kv_calibration.py` 运行离线校准生成 `model-kvscales.safetensors` 并更新 `model.safetensors.index.json`。
+     - 合入后设置 `export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1`（强校验 24/24 scale 全部加载成功），再传入 `--kv-cache-dtype fp8_e4m3 --speculative-config '{"method":"mtp","num_speculative_tokens":4,"kv_cache_dtype":"float16"}'`。
 
 ---
 
@@ -988,7 +968,7 @@ index 6d059d3..3532748 100644
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
-index 0369fac..b026a79 100644
+index 0369fac..0349d37 100644
 --- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
 @@ -25,8 +25,13 @@ from ..common.qsa_cache import (
@@ -1121,7 +1101,7 @@ index 0369fac..b026a79 100644
 +                    self.index_qk_proj, "_sm70_qwen4_exp_online_qpn8", False
 +                )
 +            ):
-+                from vllm.config.execution_policy import (
++                from vllm.compilation.sm70_decode_graph import (
 +                    use_sm70_decode_graph_semantics,
 +                )
 +
@@ -1603,7 +1583,7 @@ index c0a8a1d..8668eb1 100644
 
 ```diff
 diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
-index aa5e6a6..968e4a2 100644
+index aa5e6a6..5e90388 100644
 --- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
 +++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
 @@ -70,6 +70,14 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
@@ -2176,17 +2156,11 @@ index aa5e6a6..968e4a2 100644
  ) -> torch.Tensor:
      """Score, select, and expand QSA indices without host synchronization."""
  
-@@ -1615,29 +1782,87 @@ def qsa_select_paged_tokens(
-         compress_ratio,
-         out,
-         query_start_loc_cpu,
-+        visible_blocks_cache=visible_blocks_cache,
-     ):
+@@ -1604,6 +1771,49 @@ def qsa_select_paged_tokens(
+         raise ValueError("QSA selection output has an invalid shape")
+     if not rows:
          return out
- 
-     capacity_columns = page_table.shape[1] * k_cache.shape[1]
-     score_columns = capacity_columns
-     block_topk = token_topk // compress_ratio
++    block_topk = token_topk // compress_ratio
 +    if (
 +        max_seq_len is not None
 +        and 0 < max_seq_len
@@ -2229,6 +2203,20 @@ index aa5e6a6..968e4a2 100644
 +                num_warps=4,
 +            )
 +            return out
+     if query_start_loc_cpu is not None and _qsa_select_by_request(
+         q,
+         k_cache,
+@@ -1615,29 +1825,44 @@ def qsa_select_paged_tokens(
+         compress_ratio,
+         out,
+         query_start_loc_cpu,
++        visible_blocks_cache=visible_blocks_cache,
+     ):
+         return out
+ 
+     capacity_columns = page_table.shape[1] * k_cache.shape[1]
+     score_columns = capacity_columns
+-    block_topk = token_topk // compress_ratio
      contiguous_keys: torch.Tensor | None = None
      key_valid: torch.Tensor | None = None
      all_visible: torch.Tensor | None = None
@@ -2240,13 +2228,13 @@ index aa5e6a6..968e4a2 100644
 -            compress_ratio,
 +        start_row, end_row = (
 +            _cache_row_range if _cache_row_range is not None else (0, rows)
-+        )
+         )
 +        cache_key = (start_row, end_row, int(compress_ratio))
 +        cached_visible = (
 +            visible_blocks_cache.get(cache_key)
 +            if visible_blocks_cache is not None
 +            else None
-         )
++        )
 +        if cached_visible is None:
 +            all_visible = _qsa_visible_blocks(
 +                token_to_req,

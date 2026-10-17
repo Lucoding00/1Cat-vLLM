@@ -1771,23 +1771,6 @@ def qsa_select_paged_tokens(
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
-    if query_start_loc_cpu is not None and _qsa_select_by_request(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        query_start_loc_cpu,
-        visible_blocks_cache=visible_blocks_cache,
-    ):
-        return out
-
-    capacity_columns = page_table.shape[1] * k_cache.shape[1]
-    score_columns = capacity_columns
     block_topk = token_topk // compress_ratio
     if (
         max_seq_len is not None
@@ -1831,6 +1814,23 @@ def qsa_select_paged_tokens(
                 num_warps=4,
             )
             return out
+    if query_start_loc_cpu is not None and _qsa_select_by_request(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+        out,
+        query_start_loc_cpu,
+        visible_blocks_cache=visible_blocks_cache,
+    ):
+        return out
+
+    capacity_columns = page_table.shape[1] * k_cache.shape[1]
+    score_columns = capacity_columns
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None

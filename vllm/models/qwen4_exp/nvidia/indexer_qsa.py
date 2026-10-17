@@ -323,7 +323,7 @@ class QSAIndexer(nn.Module):
                     self.index_qk_proj, "_sm70_qwen4_exp_online_qpn8", False
                 )
             ):
-                from vllm.config.execution_policy import (
+                from vllm.compilation.sm70_decode_graph import (
                     use_sm70_decode_graph_semantics,
                 )
 
