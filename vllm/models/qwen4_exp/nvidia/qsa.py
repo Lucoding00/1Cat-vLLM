@@ -1269,7 +1269,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     state.write_staged(
                         new_key, new_value, new_slots, plan, history, scales
                     )
-                gate_rows = gate.view_as(query) if gate is not None else None
+                gate_rows = (
+                    gate[: query.shape[0]].view_as(query) if gate is not None else None
+                )
                 if history.dtype == torch.uint8:
                     # One CTA per row over all its keys (tensor-core QK/PV,
                     # 2 CTAs per SM): no partial workspace, no merge pass.
@@ -1642,14 +1644,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             q_gate = qkv[:, : self.q_size * 2].view(
                 num_tokens, self.num_heads, 2 * self.head_dim
             )
-            gate = q_gate[..., self.head_dim :]
+            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
             query = qkv
             key = value = qkv
             attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
         else:
-            q, k, v, gate = self._project_qkv_gate(
-                qkv, positions, flatten_gate=False
-            )
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
             query = q.view(num_tokens, self.num_heads, self.head_dim)
             key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
             value = v.view(num_tokens, self.num_kv_heads, self.head_dim)

@@ -720,92 +720,91 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=columns < TOPK,
             other=-1,
         )
-        if tl.max(logical_token, axis=0) >= 0:
-            safe_token = tl.maximum(logical_token, 0)
-            logical_page = safe_token // PAGE_SIZE
-            page_offset = safe_token % PAGE_SIZE
-            valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
-            if DEVICE_HISTORY:
-                valid &= (logical_token <= position) & (logical_token < length)
-            if RESOLVED_INDICES:
-                physical_page = logical_page
-            else:
-                valid &= logical_page < PAGE_TABLE_WIDTH
-                physical_page = tl.load(
-                    block_table_ptr
-                    + safe_request * stride_table_req
-                    + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-                    mask=valid,
-                    other=-1,
-                )
-            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-            # physical_page * block stride can overflow int32 for large caches.
-            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-            if HOST_CACHE:
-                hot_tokens = tl.load(
-                    HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
-                )
-                valid &= hot_tokens >= -1
-            if HOST_CACHE:
-                keys, values = load_host_kv(
-                    k_cache_ptr,
-                    v_cache_ptr,
-                    hot_tokens,
-                    row,
-                    columns,
-                    valid,
-                    dim_offsets,
-                    tl.cdiv(TOPK, 4) * 4,
-                    HEAD_DIM,
-                )
-            else:
-                keys = tl.load(
-                    k_cache_ptr
-                    + safe_page[None, :] * stride_k_block
-                    + page_offset[None, :] * stride_k_token
-                    + kv_head * stride_k_head
-                    + dim_offsets[:, None],
-                    mask=valid[None, :],
-                    other=0.0,
-                )
-                values = tl.load(
-                    v_cache_ptr
-                    + safe_page[:, None] * stride_v_block
-                    + page_offset[:, None] * stride_v_token
-                    + kv_head * stride_v_head
-                    + dim_offsets[None, :],
-                    mask=valid[:, None],
-                    other=0.0,
-                )
-            if DEVICE_HISTORY and HISTORY_E4M3:
-                slot = safe_page * PAGE_SIZE + page_offset
-                key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
-                value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
-                keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
-                    query.dtype
-                )
-                values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
-                    query.dtype
-                )
-            if KV_E4M3:
-                keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
-                values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
-            scores = tl.dot(query, keys)
-            # Scaling scores avoids re-quantizing a scaled query to BF16.
-            scores *= qk_scale_log2
-            scores = tl.where(valid[None, :], scores, -1.0e20)
-            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
-            alpha = tl.math.exp2(max_value - next_max)
-            probabilities = tl.where(
-                valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        safe_token = tl.maximum(logical_token, 0)
+        logical_page = safe_token // PAGE_SIZE
+        page_offset = safe_token % PAGE_SIZE
+        valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+        if DEVICE_HISTORY:
+            valid &= (logical_token <= position) & (logical_token < length)
+        if RESOLVED_INDICES:
+            physical_page = logical_page
+        else:
+            valid &= logical_page < PAGE_TABLE_WIDTH
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
             )
-            accumulator = tl.dot(
-                probabilities.to(values.dtype),
-                values,
-                acc=accumulator * alpha[:, None],
+        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+        # physical_page * block stride can overflow int32 for large caches.
+        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+        if HOST_CACHE:
+            hot_tokens = tl.load(
+                HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
             )
-            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
-            max_value = next_max
+            valid &= hot_tokens >= -1
+        if HOST_CACHE:
+            keys, values = load_host_kv(
+                k_cache_ptr,
+                v_cache_ptr,
+                hot_tokens,
+                row,
+                columns,
+                valid,
+                dim_offsets,
+                tl.cdiv(TOPK, 4) * 4,
+                HEAD_DIM,
+            )
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+        if DEVICE_HISTORY and HISTORY_E4M3:
+            slot = safe_page * PAGE_SIZE + page_offset
+            key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
+            value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
+            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
+                query.dtype
+            )
+            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+                query.dtype
+            )
+        if KV_E4M3:
+            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
+            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
+        scores = tl.dot(query, keys)
+        # Scaling scores avoids re-quantizing a scaled query to BF16.
+        scores *= qk_scale_log2
+        scores = tl.where(valid[None, :], scores, -1.0e20)
+        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            acc=accumulator * alpha[:, None],
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        max_value = next_max
 
     has_values = normalizer > 0
     normalized_output = tl.where(

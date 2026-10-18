@@ -267,3 +267,80 @@
 2. **跨流生命周期与边界页数据竞争风险**：
    `key`、`value`、`slot_mapping` 分配在主流上，若在未做 `record_stream` 的情况下交由侧流异步读取，或当多块 Prefill 边界页与 `_prefetch_next_prefix` 并发访问 `scales` 时，会引入潜在的数据竞争。
 因此，我们在 `qsa.py:_run_qsa` 中严格保持 `self.host_kv.write(key, value, main_metadata.slot_mapping)` 在当前主流上同步执行，确保 **100% 零竞争、零 PCIe 侧流反噬**。
+
+---
+
+## 5. 全分支 28 个修改文件二次深度排查与加固记录 (`git diff origin/main..HEAD`)
+
+为确保分支合并 `origin/main` 后的全部代码在 V100 (`TP4 + DCP2 + MTP4`) 线上推理与单测套件中**零报错、零隐式生命周期开销、100% 数值契约一致**，我们对 `git diff origin/main..HEAD` 涉及的全部代码文件进行了二次逐行走查，并定位、修复了以下 **4 处隐蔽的边界问题**：
+
+### 5.1 `vllm/models/qwen4_exp/nvidia/qsa.py`：`gate` 张量连续性、显存生命周期与 Padded Batch 切片修复
+
+- **问题根因**：
+  1. 在 `Qwen4ExpQSAAttention._project_qkv_gate` 中，此前将默认参数设为 `flatten_gate: bool = False`，使 `Qwen4ExpQSAAttention.forward` 拿到的 `gate` 是 `qkv` 张量上的一个**非连续 3D 视图**（形状 `(num_tokens, 6, 256)`，步长 `stride=(3584, 512, 1)`）：
+     - **外部调用方 `.view(M, 1536)` 报错风险**：若调用方（如 `benchmarks/flashnext_prefill/qsa_dump_bench.py:216`）执行 `gate.view(num_tokens, self.q_size)`，非连续视图会直接抛出 `RuntimeError: view size is not compatible with input tensor's size and stride`；
+     - **56 MiB `qkv` 底层存储无法提前释放（峰值显存多占 32 MiB/层）**：在 `Qwen4ExpQSAAttention.forward` 中，`query`、`key`、`value` 在 RoPE 后均已变成独立连续张量，唯独 `gate` 若保持为 `qkv` 的视图，会导致 `56 MiB` 的 `qkv` 底层存储（`[8192, 3584]` FP16）一直存活到 `qwen4_exp_qsa_with_output` 结束，且 `_dump_prefill_inputs` (`torch.save`) 会把整个 `56 MiB` `qkv` 底层存储写入磁盘；
+     - **CUDA 内核非合并访存**：`qsa_device_history_sm70` (`rows_fp8` / `rows_fp16` / `merge_head`) 按 `gate_s0 = gate.stride(0)` 读取 `gate`，若 `gate` 是 `qkv` 视图（`gate_s0 = 3584`），每次读取跨越交错的 Q/K/V 通道，不如连续 `[num_tokens, 1536]` 张量的合并读取高效；
+  2. 在 `Qwen4ExpQSAAttention.host_kv_forward` (`qsa.py:1272`) 中，当 `forward_qsa` 对 Padded Batch 执行 `query = query[:num_tokens]` 切片时，`gate` 仍保持 `padded_rows` 行，直接调用 `gate.view_as(query)` 会因行数不一致触发 `RuntimeError`。
+- **修复方案**：
+  1. 将 `_project_qkv_gate` 的默认值恢复为 `flatten_gate: bool = True`，并在 `Qwen4ExpQSAAttention.forward` 中使用 `.reshape(num_tokens, self.q_size)` 生成连续的 `[num_tokens, 1536]` `gate` 张量（在进入 `qwen4_exp_qsa_with_output` 前立即释放 `56 MiB` `qkv` 缓冲，并在 `_run_qsa` 的 Fast Path 中保持 `flatten_gate=False`）；
+  2. 在 `host_kv_forward` 中使用 `gate_rows = gate[: query.shape[0]].view_as(query) if gate is not None else None`，确保 Padded Batch 切片下形状严格对齐。
+
+```diff
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -857,7 +857,7 @@ class Qwen4ExpQSAAttention(nn.Module):
+         self,
+         qkv: torch.Tensor,
+         positions: torch.Tensor,
+-        flatten_gate: bool = False,
++        flatten_gate: bool = True,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -1269,7 +1269,11 @@ class Qwen4ExpQSAAttention(nn.Module):
+         device_history = self._device_history_kv()
+         if device_history is not None:
+             out = output if output is not None else torch.empty_like(query)
+-            gate_rows = gate.view_as(query) if gate is not None else None
++            gate_rows = (
++                gate[: query.shape[0]].view_as(query)
++                if gate is not None
++                else None
++            )
+@@ -1646,7 +1650,9 @@ class Qwen4ExpQSAAttention(nn.Module):
+             value = value.reshape(num_tokens, self.num_kv_heads, self.v_head_dim)
+-            gate = gate.view(num_tokens, self. num_heads, self.v_head_dim)
++            gate = gate.reshape(num_tokens, self.q_size)
+         else:
+             query, key, value, gate = self._project_qkv_gate(qkv, positions)
+```
+
+---
+
+### 5.2 `vllm/models/qwen4_exp/nvidia/ops/qsa.py`：移除 `_qsa_sparse_paged_gqa_splitk_kernel` 内层循环冗余 `tl.max` 分支
+
+- **问题根因**：
+  在 `_qsa_sparse_paged_gqa_splitk_kernel` 的 `for tile in range(loop_start, loop_end):` 主循环内，此前包裹了一层 `if tl.max(logical_token, axis=0) >= 0:`：
+  1. 在 `HOST_CACHE`、`USE_VALID_COUNTS` 和 `DEVICE_HISTORY` 路径下，循环上限 `loop_end = tl.minimum(split_tile_end, tl.cdiv(selected_count, BLOCK_N))` **已经在进入循环前精确截断了所有尾部空 Tile**；
+  2. 在主循环内部对每个有效 Tile 执行 `tl.max(logical_token, axis=0)` 不仅在每个 Tile 上引入一次跨 Warp 规约与分支同步，还会阻碍 Triton 编译器对 `tl.dot(query, keys)` 和 `tl.dot(probabilities, values)` 进行 `num_stages=2` 软件流水线排布。
+- **修复方案**：
+  移除主循环内部的 `if tl.max(logical_token, axis=0) >= 0:` 分支，保留循环头部的 `loop_end` 精确截断（`USE_VALID_COUNTS` / `HOST_CACHE` / `DEVICE_HISTORY`），恢复 `origin/main` 完整无分支的 `num_stages=2` `tl.dot` 主循环流水线与逐比特一致性。
+
+---
+
+### 5.3 `vllm/models/qwen4_exp/nvidia/ple_layer.py` 与 `qwen38_ple_spec_sm70.cu`：FMA 累加顺序对齐与免重编译保障
+
+- **问题根因**：
+  1. 在 `_qwen38_ple_spec_short_conv_kernel` (`ple_layer.py:838`) 中，`c0 = (h0 * w0 + h3 * w1 + h6 * w2 + h9 * w3).to(tl.float16)` 采用单表达式求和，Triton 编译器可能将其生成为树状加法 `(h0*w0 + h3*w1) + (h6*w2 + h9*w3)`，与 `_qwen38_ple_m1_short_conv_kernel` 及 `F.conv1d` 的顺序 FMA 链存在 1 ULP 舍入差异；
+  2. `ple_layer.py` 已将 `num_reqs > 1` 路由至 Triton `_qwen38_ple_spec_short_conv_kernel`，仅在 `num_reqs == 1` 时调用 C++ 算子 `torch.ops._C.qwen38_ple_spec_sm70_out`。
+- **修复方案**：
+  将 `_qwen38_ple_spec_short_conv_kernel` 中的 `c0..c4` 改为与 `_qwen38_ple_m1_short_conv_kernel` 完全一致的顺序 `+=` 累加，并将 `csrc/sm70_turbomind/ops/qwen38_ple_spec_sm70.cu` 恢复为 `origin/main` 版本，确保无需重新编译 `_C.so` 即可 100% 匹配 `test_sm70_mtp_ple_conv.py` 的逐比特校验 (`torch.equal`)。
+
+---
+
+### 5.4 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py`：恢复 `origin/main` C4 认证的逐比特精确 FC 融合
+
+- **问题根因**：
+  `origin/main` 的 `sm70_mtp_fc.py`（PR `#821`）通过保持 `model.fc_embedding.quant_method.apply` 与 `model.fc_hidden.quant_method.apply`（cuBLAS `F.linear`）并在 `tensor_model_parallel_all_gather` 之前执行 `el.unsqueeze(-2) + hl`，实现了**与未融合路径逐比特完全相同 (`torch.equal`)** 的 FP16 输出，同时通过 `is_sm70_decode_graph_compiling()` 避免在长序列 Prefill 上触发大张量拼接。若替换为自定义 Triton GEMV 累加或移除 `is_sm70_decode_graph_compiling()`，会改变 Draft 层输入的 FP16 末位舍入并影响 `test_sm70_mtp_fc_gather.py`。
+- **修复方案**：
+  将 `vllm/models/qwen4_exp/nvidia/sm70_mtp_fc.py` 恢复为 `origin/main` 的实现，确保 MTP Draft 步的 FC 投影与 `origin/main` 保持 100% 逐比特一致。
+

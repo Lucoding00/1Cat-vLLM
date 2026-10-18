@@ -832,11 +832,35 @@ def _qwen38_ple_spec_short_conv_kernel(
         tl.float32
     )
 
-    c0 = (h0 * w0 + h3 * w1 + h6 * w2 + h9 * w3).to(tl.float16)
-    c1 = (h1 * w0 + h4 * w1 + h7 * w2 + h10 * w3).to(tl.float16)
-    c2 = (h2 * w0 + h5 * w1 + h8 * w2 + h11 * w3).to(tl.float16)
-    c3 = (h3 * w0 + h6 * w1 + h9 * w2 + h12 * w3).to(tl.float16)
-    c4 = (h4 * w0 + h7 * w1 + h10 * w2 + h13 * w3).to(tl.float16)
+    c0 = h0 * w0
+    c0 += h3 * w1
+    c0 += h6 * w2
+    c0 += h9 * w3
+    c0 = c0.to(tl.float16)
+
+    c1 = h1 * w0
+    c1 += h4 * w1
+    c1 += h7 * w2
+    c1 += h10 * w3
+    c1 = c1.to(tl.float16)
+
+    c2 = h2 * w0
+    c2 += h5 * w1
+    c2 += h8 * w2
+    c2 += h11 * w3
+    c2 = c2.to(tl.float16)
+
+    c3 = h3 * w0
+    c3 += h6 * w1
+    c3 += h9 * w2
+    c3 += h12 * w3
+    c3 = c3.to(tl.float16)
+
+    c4 = h4 * w0
+    c4 += h7 * w1
+    c4 += h10 * w2
+    c4 += h13 * w3
+    c4 = c4.to(tl.float16)
 
     tl.store(
         output_ptr + start * HIDDEN_SIZE + hidden,
