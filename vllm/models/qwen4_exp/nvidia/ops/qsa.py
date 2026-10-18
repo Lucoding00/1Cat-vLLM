@@ -1632,6 +1632,14 @@ def _qsa_select_by_request(
     if all(request is None for _, _, request in segments):
         return False
     for start, end, request in segments:
+        extra_kw = (
+            {
+                "visible_blocks_cache": visible_blocks_cache,
+                "_cache_row_range": (start, end),
+            }
+            if visible_blocks_cache is not None
+            else {}
+        )
         if request is None:
             qsa_select_paged_tokens(
                 q[start:end],
@@ -1643,8 +1651,7 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
-                visible_blocks_cache=visible_blocks_cache,
-                _cache_row_range=(start, end),
+                **extra_kw,
             )
         else:
             qsa_select_paged_tokens(
@@ -1657,8 +1664,7 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
-                visible_blocks_cache=visible_blocks_cache,
-                _cache_row_range=(start, end),
+                **extra_kw,
             )
     return True
 
@@ -1761,7 +1767,11 @@ def qsa_select_paged_tokens(
     _cache_row_range: tuple[int, int] | None = None,
     max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``max_seq_len``: host upper bound of ``sequence_lengths`` (the scheduler's
+    value); it bounds the cuBLAS scoring columns without reading the device.
+    """
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -1859,11 +1869,15 @@ def qsa_select_paged_tokens(
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. Cached across QSA layers in the same forward pass.
-        score_columns = min(
-            capacity_columns,
-            max(block_topk, max_visible),
+        # model-capacity tail. Visible blocks never exceed seq_len // ratio,
+        # so the host bound needs no sync; columns past a row's visible
+        # blocks are ignored by the top-k. Without it, cached across QSA layers.
+        live_blocks = (
+            max_seq_len // compress_ratio
+            if max_seq_len is not None
+            else max_visible
         )
+        score_columns = min(capacity_columns, max(block_topk, live_blocks))
         if _qsa_indexer_cublas_work_supported(rows, score_columns):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
@@ -1886,7 +1900,15 @@ def qsa_select_paged_tokens(
         score_columns = _qsa_bounded_decode_score_columns(
             q, capacity_columns, block_topk, compress_ratio, max_seq_len
         )
-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
+    # Bound the per-chunk logits by the configured score tile on both the
+    # cuBLAS and paged paths. Startup profiling skips attention, so this
+    # transient is not in the KV budget; the default 64 MiB tile preserves the
+    # existing 128 MiB limit.
+    logits_bytes = min(
+        _LOGITS_WORKSPACE_BYTES,
+        2 * sparse_policy().value("qsa_score_tile_mb") * 1024**2,
+    )
+    rows_per_chunk = max(1, logits_bytes // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     if q.is_cuda:
         logits_buf, visible_buf, blocks_buffer = _qsa_selector_workspace(

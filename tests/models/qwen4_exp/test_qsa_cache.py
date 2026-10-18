@@ -77,6 +77,7 @@ def test_cache_binding_retains_owner_history_policy(monkeypatch, is_draft):
     attention = _bare_qsa_attention(output_width=2051)
     attention.host_kv_enabled = True
     attention.host_kv_hot_tokens = 64
+    attention.host_kv_staging_rows = 8
     attention.host_kv_device_reference = True
     attention.host_kv_is_draft = is_draft
     attention.host_kv_direct_device = True
@@ -95,6 +96,7 @@ def test_cache_binding_retains_owner_history_policy(monkeypatch, is_draft):
     attention.bind_kv_cache(torch.empty(1, 2, 16, 1, 256))
     assert seen["is_speculative_draft"] is is_draft
     assert seen["direct_device"] is True
+    assert seen["rows"] == 8
 
 
 def test_qsa_attention_reuses_shared_topk_indices_buffer() -> None:
@@ -274,7 +276,9 @@ def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
     output = torch.full_like(query, float("nan"))
     calls = []
 
-    def host_forward(q, indices, table, requests, positions, lengths, out, gate):
+    def host_forward(
+        q, indices, table, requests, positions, lengths, out, gate, metadata=None
+    ):
         # The producer owns the active output. It must not depend on a fill.
         assert torch.isnan(out).all()
         assert out.shape[0] == active
