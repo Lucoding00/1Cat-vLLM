@@ -314,7 +314,9 @@ def _hc_assemble_kernel(
             offs = start + tl.arange(0, BLOCK_SIZE)
             mask = row_valid & (offs < COLS)
             value = tl.load(
-                src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs, mask
+                src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs,
+                mask,
+                other=0.0,
             )
             tl.store(
                 dst_ptr + row.to(tl.int64) * 4 * COLS + j * COLS + offs, value, mask
@@ -396,14 +398,14 @@ def _hc_packet_silu_kernel(
         row_valid = row < rows
         base = src_ptr + (rank.to(tl.int64) * rows + row) * WIDTH
         lora_mask = row_valid & (offs < LORA)
-        x = tl.load(base + offs, lora_mask).to(tl.float32) / HC
+        x = tl.load(base + offs, lora_mask, other=0.0).to(tl.float32) / HC
         y = x * tl.sigmoid(x)
         tl.store(
             lora_ptr + row.to(tl.int64) * 4 * LORA + j * LORA + offs, y, lora_mask
         )
         if j == 3:
             inj_mask = row_valid & (offs < INJ)
-            inj = tl.load(base + LORA + offs, inj_mask)
+            inj = tl.load(base + LORA + offs, inj_mask, other=0.0)
             tl.store(inj_ptr + row.to(tl.int64) * INJ + offs, inj, inj_mask)
 
 

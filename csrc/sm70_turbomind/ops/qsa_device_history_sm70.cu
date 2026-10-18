@@ -763,8 +763,8 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
   }
 }
 
-template <int MIN_BLOCKS, bool MMA_PV>
-__global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp16(Args a) {
+template <bool MMA_PV>
+__global__ __launch_bounds__(256) void rows_fp16(Args a) {
   const int row = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   __shared__ __align__(16) half query[8][PAD];
@@ -1099,13 +1099,15 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
       }
     } else {
       switch (whole_rows) {
+        case 1:
         case 2:
         case 3:
-          device_qsa::rows_fp16<2, false><<<a.M, 256, 0, stream>>>(a);
+          device_qsa::rows_fp16<false><<<a.M, 256, 0, stream>>>(a);
           break;
+        case 11:
         case 12:
         case 13:
-          device_qsa::rows_fp16<2, true><<<a.M, 256, 0, stream>>>(a);
+          device_qsa::rows_fp16<true><<<a.M, 256, 0, stream>>>(a);
           break;
         default:
           TORCH_CHECK(false, "invalid whole_rows ", whole_rows);

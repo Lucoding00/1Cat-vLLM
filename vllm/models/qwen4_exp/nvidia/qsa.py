@@ -86,7 +86,7 @@ _SM70_QSA_PREPARED_Q_WORKSPACES: dict[
 _TARGET_HOST_KV: list = []
 # Prefix staging prefetch: side stream, per-buffer "free" events (after the
 # last attention that read it) and pending prefetches by owner.
-_PREFETCH: dict = {"stream": None, "free": [None, None], "pending": {}, "write_stream": None}
+_PREFETCH: dict = {"stream": None, "free": [None, None], "pending": {}}
 
 # Diagnostics: real prefill reader inputs (TP rank 0, one long-context step
 # per selected target layer) for offline kernel work. Off unless set.
@@ -1501,21 +1501,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         dense = self._use_dense_short_context(num_tokens, side_metadata)
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        async_host_write_stream = None
         if self.host_kv_enabled:
-            if (
-                key.is_cuda
-                and num_tokens > getattr(self.host_kv, "resolve_rows", 32)
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                if _PREFETCH["write_stream"] is None:
-                    _PREFETCH["write_stream"] = torch.cuda.Stream(device=key.device)
-                async_host_write_stream = _PREFETCH["write_stream"]
-                async_host_write_stream.wait_stream(torch.cuda.current_stream(key.device))
-                with torch.cuda.stream(async_host_write_stream):
-                    self.host_kv.write(key, value, main_metadata.slot_mapping)
-            else:
-                self.host_kv.write(key, value, main_metadata.slot_mapping)
+            self.host_kv.write(key, value, main_metadata.slot_mapping)
             # A staged prefill writes these rows into its stage buffer too.
             self._host_kv_new = (key, value, main_metadata.slot_mapping)
         elif query.dim() == 2:
@@ -1613,8 +1600,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "qsa",
             selected,
         )
-        if async_host_write_stream is not None:
-            torch.cuda.current_stream(key.device).wait_stream(async_host_write_stream)
         impl.forward_qsa(
             self,
             query,

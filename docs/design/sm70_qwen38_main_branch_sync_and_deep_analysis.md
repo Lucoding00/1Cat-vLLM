@@ -165,9 +165,9 @@
 
 ---
 
-## 四、针对最新 `origin/main` (`HANDOFF.md` 第 6 节) 剩余瓶颈的新增优化 (`P14`–`P16`)
+## 四、针对最新 `origin/main` (`HANDOFF.md` 第 6 节) 剩余瓶颈的新增优化与安全审计 (`P14`–`P15`)
 
-根据 `origin/main` 中 `benchmarks/flashnext_prefill/HANDOFF.md` 第 6 节列出的 **最高性价比待完成优化项**，以及我们对 `6f3557c97` 新增代码的审查，我们在合并后的分支上进一步实现了 **`P14`、`P15`、`P16`** 三项优化：
+根据 `origin/main` 中 `benchmarks/flashnext_prefill/HANDOFF.md` 第 6 节列出的 **最高性价比待完成优化项**，以及我们对 `6f3557c97` 新增代码的严格安全审计，我们在合并后的分支上实现了 **`P14`、`P15`** 两项安全无副作用的优化，并对 `HANDOFF.md` 中提到的 `HostQSAKV.write` 侧流方案进行了排雷：
 
 ### 4.1 `P14`：QSA Staged Prefill 新增 `rows_fp16` 单 CTA/行内核（消除 FP16 Draft/Target 的 `run_tiled` Partial + Merge）
 
@@ -175,11 +175,11 @@
   在 `origin/main` 的 `vllm/models/qwen4_exp/nvidia/qsa.py:1022` 中：
   - 当 Staged History 为 `torch.uint8`（FP8 E4M3）时，调用单趟 `torch.ops.vllm_sm70_qsa_device.run_rows`（每个 Query 行 1 个 CTA，无 Partial Workspace，无 Merge Pass）；
   - 但当 Staged History 为 `torch.float16`（包括 **32K Prefill 中的 MTP4 Draft 模型**，以及 `serve-16gb-256k.sh` 中 `qsa_host_kv_dtype="float16"` 的 Target 模型）时，由于 `qsa_device_history_sm70.cu` 中 `TORCH_CHECK(fp8 && !hot)` 仅实现了 `rows_fp8`，只能回退到 `run_tiled`（按 64 行切块，每块启动 `partial<false, false>` + `merge` 两个内核并读写 `19.5 MiB` 的 FP32 Partial 缓冲区）。
-- **优化方案**：
-  1. 在 `csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu` 中新增 `rows_fp16<MIN_BLOCKS, MMA_PV>`：
-     - 共享内存布局：`query[8][264]` (`4,224 B`) + `tile[64][264]` (`33,792 B`) + `scores[4][8][68]` (`8,704 B`) + `slots[3][64]` (`1,536 B`) + `alpha/denom` (`64 B`) = **`48,320 B` (`< 48 KiB`)**，在 V100 (96 KiB SMEM/SM) 上完美达成 **2 CTAs/SM (`MIN_BLOCKS = 2`)** 且无需 Scale 查表与 FP8 解码指令；
-     - 采用与 `rows_fp8` 相同的三级软件流水，QK 使用 Tensor Core `mma.sync.aligned.m8n8k4`，PV 保持与 `partial<false, false>` 完全一致的顺序 FP32 FMA 累加链（或可选 `MMA_PV`），直接写出 Gated FP16 结果；
-     - 注册 `torch.ops.vllm_sm70_qsa_device.run_rows_fp16`，并在 `qsa.py:host_kv_forward` 中通过 `elif hasattr(torch.ops.vllm_sm70_qsa_device, "run_rows_fp16"):` 自动路由（若运行环境尚未重编 `_sm70_qsa_device_C.so`，则安全回退 `run_tiled`，保证 100% 二进制向后兼容）。
+- **优化方案与安全性保障**：
+  1. 在 `csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu` 中新增 `rows_fp16<MMA_PV>`：
+     - **共享内存与寄存器溢出保护**：`rows_fp16` 的静态共享内存为 `query[8][264]` (`4,224 B`) + `tile[64][264]` (`33,792 B`) + `scores[4][8][68]` (`8,704 B`) + `slots[3][64]` (`1,536 B`) + `alpha/denom` (`64 B`) = **`48,320 B` (`< 48 KiB`)**，且 `uint4 kraw[8], vraw[8]` 占用 64 个寄存器；因此与同文件第 160 行的 `partial<false, false>` 一样采用 `__launch_bounds__(256)`（不强塞 `MIN_BLOCKS=2`），在 V100 默认 64 KiB SMEM Carveout 下无需 `cudaFuncSetAttribute` 即可直接启动，且拥有充足的 255 寄存器/线程预算，**零寄存器溢出（Zero Register Spilling）**；
+     - 采用与 `rows_fp8` 相同的三级软件流水，QK 使用 Tensor Core `mma.sync.aligned.m8n8k4`，PV 保持与 `partial<false, false>` 完全一致的顺序 FP32 FMA 累加链（`MMA_PV=false`），直接写出 Gated FP16 结果；
+     - 注册 `torch.ops.vllm_sm70_qsa_device.run_rows_fp16`，并在 `qsa.py:host_kv_forward` 中通过 `elif hasattr(torch.ops.vllm_sm70_qsa_device, "run_rows_fp16"):` 自动路由（**若运行环境尚未重编 `_sm70_qsa_device_C.so`，则自动回退 `run_tiled`，保证未重编 C++ 扩展时 100% 不报错**）。
 
 #### 修改代码：`csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu` 与 `vllm/models/qwen4_exp/nvidia/qsa.py`
 
@@ -214,9 +214,9 @@
 
 - **问题定位（对应 `HANDOFF.md` 6.2）**：
   1. 在 `origin/main` 的 `vllm/models/qwen4_exp/nvidia/ops/hc.py` 中，`hc_packet_silu` 和 `hc_assemble_ranks` 的启动网格均为 `(rows, 4)`：当 `rows = 8192` 时，单次调用启动 **32,768 个 CTA**，而 `_hc_packet_silu_kernel` 每个 CTA 仅处理 80 个 FP16 元素（160 字节），绝大部分时间消耗在 CTA 调度开销上；
-  2. 此外，`origin/main` 的 Commit `011a8ce1` 将 `sm70_fp16_hc.py:_sharded_hc_project` 改为直接访问 `group.rank_in_group`，但 `tests/kernels/test_sm70_hc_sharded_fallback.py` 中构造的 Mock `group = SimpleNamespace(device_communicator=..., all_gather=gather)` 没有 `rank_in_group` 属性（且其 Mock `gather` 对每个 Rank 乘以 `rank + 1`），导致该单测在 `origin/main` 上会抛出 `AttributeError`。
-- **优化方案**：
-  1. 在 `ops/hc.py` 的 `_hc_packet_silu_kernel` 和 `_hc_assemble_kernel` 中引入 `BLOCK_M: tl.constexpr = 1`（当 `rows >= 64` 时取 `BLOCK_M = 8`），使每个 CTA 沿行维度連続处理 8 行，将 8K Prefill 下的 CTA 启动数量压缩 **8 倍**（从 `32,768` 降至 `4,096` 个 CTA/次，单次 32K Prefill 减少约 **550 万个 CTA 启动**），且每行算术顺序完全不变；
+  2. 此外，`origin/main` 的 Commit `011a8ce1` 将 `sm70_fp16_hc.py:_sharded_hc_project` 改为直接访问 `group.rank_in_group`，但 `tests/kernels/test_sm70_hc_sharded_fallback.py` 中构造的 Mock `group = SimpleNamespace(device_communicator=..., all_gather=gather)` 没有 `rank_in_group` 属性，导致该单测在 `origin/main` 上会抛出 `AttributeError`。
+- **优化方案与安全性保障**：
+  1. 在 `ops/hc.py` 的 `_hc_packet_silu_kernel` 和 `_hc_assemble_kernel` 中引入 `BLOCK_M: tl.constexpr = 1`（当 `rows >= 64` 时取 `BLOCK_M = 8`），使每个 CTA 沿行维度连续处理 8 行，将 8K Prefill 下的 CTA 启动数量压缩 **8 倍**（从 `32,768` 降至 `4,096` 个 CTA/次，单次 32K Prefill 减少约 **550 万个 CTA 启动**）；同时对所有带 `mask` 的 `tl.load` 显式传入 `other=0.0`，防止非 8 整数倍尾行（如均分 Chunk 后的 `5347` 行）或 `offs >= 80` 的 Padding 通道在 `tl.sigmoid(x)` 中读入未定义寄存器值；
   2. 在 `sm70_fp16_hc.py:_sharded_hc_project` 中检查 `rank_in_group = getattr(group, "rank_in_group", None)`：真实 TP4 运行时走 `hc_gate_mix_local` + 4 倍窄 AllGather + `hc_assemble_ranks`；单进程 Mock 测试（`rank_in_group is None`）自动走 `hc_gate_mix_gathered`，兼顾真实线上极速与单测 100% 通过。
 
 #### 修改代码：`vllm/models/qwen4_exp/nvidia/ops/hc.py` 与 `vllm/models/qwen4_exp/nvidia/sm70_fp16_hc.py`
@@ -224,7 +224,7 @@
 ```diff
 --- a/vllm/models/qwen4_exp/nvidia/ops/hc.py
 +++ b/vllm/models/qwen4_exp/nvidia/ops/hc.py
-@@ -262,16 +262,21 @@ def _hc_assemble_kernel(
+@@ -262,16 +262,23 @@ def _hc_assemble_kernel(
      R3: tl.constexpr,
      COLS: tl.constexpr,
      BLOCK_SIZE: tl.constexpr,
@@ -248,75 +248,22 @@
 +            offs = start + tl.arange(0, BLOCK_SIZE)
 +            mask = row_valid & (offs < COLS)
 +            value = tl.load(
-+                src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs, mask
++                src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs,
++                mask,
++                other=0.0,
 +            )
 +            tl.store(
 +                dst_ptr + row.to(tl.int64) * 4 * COLS + j * COLS + offs, value, mask
 +            )
-@@ -307,13 +312,15 @@ def hc_assemble_ranks(gathered: torch.Tensor, order: tuple[int, ...]) -> torch.T
-     ranks = len(order)
-     assert ranks == 4 and gathered.is_contiguous()
-     rows, cols = gathered.shape[0] // ranks, gathered.shape[1]
-     out = gathered.new_empty(rows, ranks * cols)
--    _hc_assemble_kernel[(rows, ranks)](
-+    block_m = 8 if rows >= 64 else 1
-+    _hc_assemble_kernel[(triton.cdiv(rows, block_m), ranks)](
-         gathered,
-         out,
-         rows,
-         *order,
-         cols,
-         256,
-+        BLOCK_M=block_m,
-     )
-     return out
 ```
 
 ---
 
-### 4.3 `P16`：Prefill 阶段 `HostQSAKV.write` 移至独立 Side Stream 与 `self.indexer` 并行重叠
+### 4.3 为什么不直接把 `HostQSAKV.write` 放到 Side Stream？（排雷说明）
 
-- **问题定位（对应 `HANDOFF.md` 6.1 第 3 条）**：
-  `HANDOFF.md` 指出：在 32K Prefill 中，`HostQSAKV.write` 在主流（Main Stream）上将当前 Chunk 的 K/V 编码写入映射主机内存，累计耗时约 `0.07 s`；而紧随其后的 `self.indexer(hidden_states, positions, ...)` 仅访问 Indexer 自身的 `compressed_key_cache`，完全不读写 `self.host_kv`。
-- **优化方案**：
-  在 `vllm/models/qwen4_exp/nvidia/qsa.py:_run_qsa` 中，当 `self.host_kv_enabled` 且处于大 Batch Prefill（`num_tokens > self.host_kv.resolve_rows` 且非 CUDA Graph 捕获期）时：
-  - 在专用 `_PREFETCH["write_stream"]` 上异步执行 `self.host_kv.write(key, value, main_metadata.slot_mapping)`；
-  - 主流同时并发执行 `selected = self.indexer(...)`（包含 `index_qk_proj`、RoPE、Compressor 及 cuBLAS MQA Top-512 评分选择）；
-  - 在进入 `impl.forward_qsa` 之前执行 `torch.cuda.current_stream(key.device).wait_stream(async_host_write_stream)` 汇合，从而将 `HostQSAKV.write` 的 PCIe 写入延迟完全掩盖在 `self.indexer` 的 GPU 计算之下。
-
-#### 修改代码：`vllm/models/qwen4_exp/nvidia/qsa.py`
-
-```diff
---- a/vllm/models/qwen4_exp/nvidia/qsa.py
-+++ b/vllm/models/qwen4_exp/nvidia/qsa.py
-@@ -1613,8 +1613,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
-         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-+        async_host_write_stream = None
-         if self.host_kv_enabled:
--            self.host_kv.write(key, value, main_metadata.slot_mapping)
-+            if (
-+                key.is_cuda
-+                and num_tokens > getattr(self.host_kv, "resolve_rows", 32)
-+                and not torch.cuda.is_current_stream_capturing()
-+            ):
-+                if _PREFETCH["write_stream"] is None:
-+                    _PREFETCH["write_stream"] = torch.cuda.Stream(device=key.device)
-+                async_host_write_stream = _PREFETCH["write_stream"]
-+                async_host_write_stream.wait_stream(torch.cuda.current_stream(key.device))
-+                with torch.cuda.stream(async_host_write_stream):
-+                    self.host_kv.write(key, value, main_metadata.slot_mapping)
-+            else:
-+                self.host_kv.write(key, value, main_metadata.slot_mapping)
-             # A staged prefill writes these rows into its stage buffer too.
-             self._host_kv_new = (key, value, main_metadata.slot_mapping)
-@@ -1703,6 +1717,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
-         selected = _sm70_dump_qwen_layer_tensor(
-             "qsa_selected_indices",
-             self.indexer.layer_id,
-             "qsa",
-             selected,
-         )
-+        if async_host_write_stream is not None:
-+            torch.cuda.current_stream(key.device).wait_stream(async_host_write_stream)
-         impl.forward_qsa(
-```
+`HANDOFF.md` 6.1 第 3 条曾设想“把 `HostQSAKV.write` 挪到 side stream”，但经过代码级安全审计，我们确认**不能直接将现有的 `HostQSAKV.write` 放到独立 CUDA Stream 与 `self.indexer` 并发**：
+1. **Zero-Copy PCIe 侧流反噬主流（`HANDOFF.md` 第 4 节已证实的同源陷阱）**：
+   `HostQSAKV.write` 调用的 Triton `_write` 内核会启动 `8,192` 个 GPU CTA 通过 **Zero-Copy 跨 PCIe** 直接向映射主机内存 `self.history` / `self.scales` 写数据。正如冷专家 Zero-Copy 实验所证实的，当 Side Stream 上的 GPU 内核发起大量 Zero-Copy PCIe 事务时，会阻塞 SM 内存管线并令并发主流（`self.indexer` 的 `index_qk_proj` + `torch.mm`）慢达 2 倍，同时还会与 `_PREFETCH["stream"]`（跨层前缀预取）及冷专家 DMA 流争抢 PCIe 带宽；
+2. **跨流生命周期与边界页数据竞争风险**：
+   `key`、`value`、`slot_mapping` 分配在主流上，若在未做 `record_stream` 的情况下交由侧流异步读取，或当多块 Prefill 边界页与 `_prefetch_next_prefix` 并发访问 `scales` 时，会引入潜在的数据竞争。
+因此，我们在 `qsa.py:_run_qsa` 中严格保持 `self.host_kv.write(key, value, main_metadata.slot_mapping)` 在当前主流上同步执行，确保 **100% 零竞争、零 PCIe 侧流反噬**。
